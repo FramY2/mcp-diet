@@ -1,0 +1,306 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PassThrough } from "node:stream";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { parseCliArgs } from "../src/cli.js";
+import {
+  filterToolsList,
+  guardToolCallResult,
+  isReadOnlyTool,
+  redactSecretsInText,
+  startStdioMcpProxy,
+  transformJsonRpcMessage,
+  type McpToolDefinition,
+} from "../src/proxy.js";
+
+const tempDirs: string[] = [];
+afterEach(async () => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop()!;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+const SAMPLE_TOOLS: McpToolDefinition[] = [
+  {
+    name: "delete_repository",
+    description:
+      "Permanently deletes an entire GitHub repository and all associated issues, pull requests, and releases.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner: { type: "string", description: "Repository owner username" },
+        repo: { type: "string", description: "Repository name to delete" },
+      },
+    },
+    annotations: { destructiveHint: true, readOnlyHint: false },
+  },
+  {
+    name: "get_pull_request",
+    description:
+      "Fetches details of a specific pull request including title, body, state, and mergeability status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Repository name" },
+        number: { type: "number", description: "Pull request number" },
+      },
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "list_issues",
+    description:
+      "Lists issues in a repository with filtering by state, labels, and assignee.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        state: {
+          type: "string",
+          description:
+            "Filter issues by open, closed, or all states across the repository.",
+        },
+      },
+    },
+  },
+];
+
+describe("mcp-diet — tools/list tree-shaking and prefix-cache determinism", () => {
+  it("filters tools by --allow, --deny, and --read-only and sorts deterministically by name", () => {
+    const readOnlyRes = filterToolsList(SAMPLE_TOOLS, { readOnly: true });
+    expect(readOnlyRes.tools.map((t) => t.name)).toEqual([
+      "get_pull_request",
+      "list_issues",
+    ]);
+    expect(readOnlyRes.stats.removedTools).toEqual(["delete_repository"]);
+    expect(readOnlyRes.stats.savedBytes).toBeGreaterThan(100);
+
+    const allowWildcard = filterToolsList(SAMPLE_TOOLS, {
+      allow: ["get_*"],
+    });
+    expect(allowWildcard.tools.map((t) => t.name)).toEqual([
+      "get_pull_request",
+    ]);
+
+    const denyWildcard = filterToolsList(SAMPLE_TOOLS, {
+      deny: ["delete_*", "list_*"],
+    });
+    expect(denyWildcard.tools.map((t) => t.name)).toEqual([
+      "get_pull_request",
+    ]);
+  });
+
+  it("truncates tool and property descriptions deterministically with --max-desc", () => {
+    const res = filterToolsList(SAMPLE_TOOLS, { maxDescChars: 40 });
+    for (const tool of res.tools) {
+      expect((tool.description ?? "").length).toBeLessThanOrEqual(40);
+      expect(tool.description?.endsWith("...")).toBe(true);
+    }
+    const firstRun = JSON.stringify(res.tools);
+    const secondRun = JSON.stringify(
+      filterToolsList([...SAMPLE_TOOLS].reverse(), { maxDescChars: 40 }).tools,
+    );
+    expect(firstRun).toBe(secondRun);
+  });
+
+  it("identifies read-only tools via annotations.readOnlyHint or name heuristics", () => {
+    expect(
+      isReadOnlyTool({
+        name: "custom_mutation",
+        annotations: { readOnlyHint: true },
+      }),
+    ).toBe(true);
+    expect(
+      isReadOnlyTool({
+        name: "get_secret_but_destructive",
+        annotations: { destructiveHint: true },
+      }),
+    ).toBe(false);
+    expect(isReadOnlyTool({ name: "search_code" })).toBe(true);
+    expect(isReadOnlyTool({ name: "drop_table" })).toBe(false);
+  });
+});
+
+describe("mcp-diet — oversized tools/call crash guard & secret redaction", () => {
+  it("redacts Anthropic, OpenAI, GitHub, AWS, URI userinfo, AccountKey, and Bearer secrets", () => {
+    const raw = [
+      "ANTHROPIC=sk-ant-api03-1234567890abcdefghijklmnop",
+      "OPENAI=sk-proj-1234567890abcdefghijklmnop",
+      "GITHUB=ghp_1234567890abcdefghijklmnopqrstuvwx",
+      "AWS=AKIA1234567890ABCDEF",
+      "DSN=postgres://admin:super_secret_pw@db.internal:5432/prod",
+      "AZURE=AccountKey=wJalrXUtnFEMI/K7MDENG/bPxRfiCYzSecretKey==",
+      "AUTH=Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secretpayload",
+    ].join("\n");
+
+    const redacted = redactSecretsInText(raw);
+    expect(redacted).toContain("***REDACTED***");
+    expect(redacted).not.toContain("1234567890abcdefghijklmnop");
+    expect(redacted).not.toContain("super_secret_pw");
+    expect(redacted).not.toContain("wJalrXUtnFEMI/K7MDENG/bPxRfiCYzSecretKey");
+    expect(redacted).not.toContain("secretpayload");
+  });
+
+  it("spills oversized tools/call results to a temp file and returns a bounded preview", async () => {
+    const spillDir = await mkdtemp(join(tmpdir(), "mcp-diet-test-"));
+    tempDirs.push(spillDir);
+
+    const hugeText = `sk-ant-api03-1234567890abcdefghijklmnop\n${"x".repeat(20_000)}`;
+    const guarded = await guardToolCallResult(
+      {
+        content: [{ type: "text", text: hugeText }],
+      },
+      {
+        maxResultKb: 4,
+        redactSecrets: true,
+        spillDir,
+      },
+    );
+
+    expect(guarded.spilledPath).toBeTruthy();
+    const spilledContent = await readFile(guarded.spilledPath!, "utf8");
+    expect(spilledContent).toContain("***REDACTED***");
+    expect(spilledContent).not.toContain("1234567890abcdefghijklmnop");
+
+    const resultRecord = guarded.result as {
+      content: Array<{ type: string; text: string }>;
+    };
+    expect(resultRecord.content[0]?.text).toContain(
+      "[mcp-diet] Oversized tool output intercepted",
+    );
+    expect(resultRecord.content[0]?.text).toContain(guarded.spilledPath!);
+    expect(resultRecord.content[0]?.text.length).toBeLessThan(4096);
+  });
+
+  it("transforms JSON-RPC tools/list and tools/call messages end-to-end", async () => {
+    const pending = new Map<string | number, string>([[2, "tools/call"]]);
+    const listLine = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      result: { tools: SAMPLE_TOOLS },
+    });
+    const filteredLine = await transformJsonRpcMessage(
+      listLine,
+      { readOnly: true, maxDescChars: 50 },
+      pending,
+    );
+    const parsedList = JSON.parse(filteredLine) as {
+      result: { tools: McpToolDefinition[] };
+    };
+    expect(parsedList.result.tools).toHaveLength(2);
+
+    const callLine = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      result: {
+        content: [
+          {
+            type: "text",
+            text: "Leaked token: ghp_1234567890abcdefghijklmnopqrstuvwx",
+          },
+        ],
+      },
+    });
+    const redactedCall = await transformJsonRpcMessage(
+      callLine,
+      { redactSecrets: true },
+      pending,
+    );
+    expect(redactedCall).toContain("***REDACTED***");
+    expect(redactedCall).not.toContain("1234567890abcdefghijklmnopqrstuvwx");
+  });
+
+  it("proxies a live child stdio MCP server process end-to-end", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "mcp-diet-stdio-"));
+    tempDirs.push(dir);
+    const fakeServerPath = join(dir, "fake-mcp-server.mjs");
+    await writeFile(
+      fakeServerPath,
+      [
+        'import { createInterface } from "node:readline";',
+        "const rl = createInterface({ input: process.stdin });",
+        'rl.on("line", (line) => {',
+        "  const msg = JSON.parse(line);",
+        '  if (msg.method === "tools/list") {',
+        "    process.stdout.write(JSON.stringify({",
+        '      jsonrpc: "2.0",',
+        "      id: msg.id,",
+        "      result: {",
+        "        tools: [",
+        '          { name: "read_file", description: "Read file contents from workspace", annotations: { readOnlyHint: true } },',
+        '          { name: "delete_file", description: "Delete file permanently", annotations: { destructiveHint: true } }',
+        "        ]",
+        "      }",
+        '    }) + "\\n");',
+        "  }",
+        "});",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const clientIn = new PassThrough();
+    const clientOut = new PassThrough();
+    const proxy = startStdioMcpProxy({
+      command: process.execPath,
+      args: [fakeServerPath],
+      options: { readOnly: true },
+      clientIn,
+      clientOut,
+    });
+
+    const responsePromise = new Promise<string>((resolve) => {
+      let buf = "";
+      clientOut.on("data", (chunk: Buffer) => {
+        buf += chunk.toString();
+        if (buf.includes("\n")) {
+          resolve(buf.trim());
+        }
+      });
+    });
+
+    clientIn.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 10, method: "tools/list", params: {} })}\n`,
+    );
+
+    const responseLine = await responsePromise;
+    proxy.close();
+
+    const parsed = JSON.parse(responseLine) as {
+      id: number;
+      result: { tools: McpToolDefinition[] };
+    };
+    expect(parsed.id).toBe(10);
+    expect(parsed.result.tools.map((t) => t.name)).toEqual(["read_file"]);
+  });
+
+  it("parses CLI flags cleanly", () => {
+    const parsed = parseCliArgs([
+      "--read-only",
+      "--allow",
+      "get_*,list_*",
+      "--deny=delete_*",
+      "--max-desc",
+      "120",
+      "--max-result-kb=256",
+      "--redact-secrets",
+      "--",
+      "npx",
+      "-y",
+      "@modelcontextprotocol/server-github",
+    ]);
+    expect(parsed.options.readOnly).toBe(true);
+    expect(parsed.options.allow).toEqual(["get_*,list_*"]);
+    expect(parsed.options.deny).toEqual(["delete_*"]);
+    expect(parsed.options.maxDescChars).toBe(120);
+    expect(parsed.options.maxResultKb).toBe(256);
+    expect(parsed.options.redactSecrets).toBe(true);
+    expect(parsed.command).toBe("npx");
+    expect(parsed.commandArgs).toEqual([
+      "-y",
+      "@modelcontextprotocol/server-github",
+    ]);
+  });
+});

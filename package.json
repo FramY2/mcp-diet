@@ -1,0 +1,63 @@
+{
+  "name": "@framy2/mcp-diet",
+  "version": "0.1.0",
+  "description": "Zero-dependency stdio MCP proxy and runtime context firewall: deterministic tools/list tree-shaking, oversized tools/call crash guard, and live secret redaction for Claude Code, OpenAI Codex, and Cursor.",
+  "type": "module",
+  "bin": {
+    "mcp-diet": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test && npm run build",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "codex",
+    "cursor",
+    "context-window",
+    "tree-shaking",
+    "proxy",
+    "firewall",
+    "secret-redaction",
+    "tokens"
+  ],
+  "license": "MIT",
+  "author": "Christian Frascogna <chriss196422@gmail.com> (https://github.com/FramY2)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FramY2/mcp-diet.git"
+  },
+  "bugs": {
+    "url": "https://github.com/FramY2/mcp-diet/issues"
+  },
+  "homepage": "https://github.com/FramY2/mcp-diet#readme",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}
