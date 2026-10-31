@@ -276,6 +276,138 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
     expect(parsed.result.tools.map((t) => t.name)).toEqual(["read_file"]);
   });
 
+  it("blocks forbidden tools/call requests at the firewall and handles multi-line JSON + stdout banners", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "mcp-diet-firewall-"));
+    tempDirs.push(dir);
+    const fakeServerPath = join(dir, "fake-multiline-mcp.mjs");
+    await writeFile(
+      fakeServerPath,
+      [
+        'import { createInterface } from "node:readline";',
+        'process.stdout.write("MCP server diagnostic startup banner\\n");',
+        "const rl = createInterface({ input: process.stdin });",
+        'rl.on("line", (line) => {',
+        "  const msg = JSON.parse(line);",
+        '  if (msg.method === "tools/list") {',
+        "    process.stdout.write(JSON.stringify({",
+        '      jsonrpc: "2.0",',
+        "      id: msg.id,",
+        "      result: {",
+        "        tools: [",
+        '          { name: "read_file", description: "Read file", annotations: { readOnlyHint: true } },',
+        '          { name: "delete_file", description: "Delete file", annotations: { destructiveHint: true } }',
+        "        ]",
+        "      }",
+        '    }, null, 2) + "\\n");',
+        "  }",
+        '  if (msg.method === "tools/call") {',
+        "    process.stdout.write(JSON.stringify({",
+        '      jsonrpc: "2.0",',
+        "      id: msg.id,",
+        '      result: { content: [{ type: "text", text: "executed:" + msg.params.name }] }',
+        '    }) + "\\n");',
+        "  }",
+        "});",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const clientIn = new PassThrough();
+    const clientOut = new PassThrough();
+    const proxy = startStdioMcpProxy({
+      command: process.execPath,
+      args: [fakeServerPath],
+      options: { readOnly: true },
+      clientIn,
+      clientOut,
+    });
+
+    const lines: string[] = [];
+    const waitForLines = (count: number) =>
+      new Promise<void>((resolve) => {
+        const check = () => {
+          if (lines.length >= count) resolve();
+        };
+        check();
+        clientOut.on("data", (chunk: Buffer) => {
+          for (const l of chunk.toString().split(/\r?\n/)) {
+            if (l.trim()) lines.push(l.trim());
+          }
+          check();
+        });
+      });
+
+    clientIn.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })}\n`,
+    );
+    await waitForLines(2);
+
+    expect(lines[0]).toBe("MCP server diagnostic startup banner");
+    const listResp = JSON.parse(lines[1]!) as {
+      result: { tools: McpToolDefinition[] };
+    };
+    expect(listResp.result.tools.map((t) => t.name)).toEqual(["read_file"]);
+
+    // Attempt a forbidden tools/call to delete_file -> blocked by firewall without hitting server
+    clientIn.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "delete_file", arguments: { path: "/etc/passwd" } },
+      })}\n`,
+    );
+    await waitForLines(3);
+
+    const blockedResp = JSON.parse(lines[2]!) as {
+      id: number;
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    expect(blockedResp.id).toBe(2);
+    expect(blockedResp.result.isError).toBe(true);
+    expect(blockedResp.result.content[0]?.text).toContain(
+      'Tool call "delete_file" blocked by runtime firewall policy',
+    );
+    proxy.close();
+  });
+
+  it("summarizes oversized image and resource content blocks without dumping raw base64", async () => {
+    const spillDir = await mkdtemp(join(tmpdir(), "mcp-diet-media-"));
+    tempDirs.push(spillDir);
+
+    const guardedImage = await guardToolCallResult(
+      {
+        isError: true,
+        content: [
+          {
+            type: "image",
+            mimeType: "image/png",
+            data: "A".repeat(12_000),
+          },
+          {
+            type: "resource",
+            resource: {
+              uri: "file:///logs/app.log",
+              text: "Resource log line summary",
+            },
+          },
+        ],
+      },
+      { maxResultKb: 2, spillDir },
+    );
+
+    const res = guardedImage.result as {
+      isError?: boolean;
+      content: Array<{ text: string }>;
+    };
+    expect(res.isError).toBe(true);
+    expect(res.content[0]?.text).toContain(
+      "[image block (image/png, 12000 base64 chars)]",
+    );
+    expect(res.content[0]?.text).toContain("Resource log line summary");
+    expect(res.content[0]?.text).not.toContain("AAAAAAAAAA");
+  });
+
   it("parses CLI flags cleanly", () => {
     const parsed = parseCliArgs([
       "--read-only",

@@ -1,8 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
@@ -46,7 +47,7 @@ const READ_ONLY_NAME_PATTERN =
   /^(?:get|list|read|search|find|query|inspect|view|fetch|describe|check|count|show|stat|status|head|tail|cat|ls)(?:[_-]|$)/i;
 
 const DESTRUCTIVE_NAME_PATTERN =
-  /(?:^|[_-])(?:delete|remove|drop|destroy|truncate|write|update|create|insert|put|post|patch|exec|execute|run|kill| push|commit|merge|deploy|mutate|set|reset|clear)(?:[_-]|$)/i;
+  /(?:^|[_-])(?:delete|remove|drop|destroy|truncate|write|update|create|insert|put|post|patch|exec|execute|run|kill|push|commit|merge|deploy|mutate|set|reset|clear)(?:[_-]|$)/i;
 
 function matchesPattern(name: string, pattern: string): boolean {
   const trimmed = pattern.trim();
@@ -59,6 +60,13 @@ function matchesPattern(name: string, pattern: string): boolean {
     return new RegExp(`^${escaped}$`, "i").test(name);
   }
   return name.toLowerCase() === trimmed.toLowerCase();
+}
+
+function normalizePatternList(patterns?: string[]): string[] {
+  return (patterns ?? [])
+    .flatMap((item) => item.split(","))
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 export function isReadOnlyTool(tool: McpToolDefinition): boolean {
@@ -75,6 +83,39 @@ export function isReadOnlyTool(tool: McpToolDefinition): boolean {
     return false;
   }
   return READ_ONLY_NAME_PATTERN.test(tool.name);
+}
+
+export function isToolCallAllowed(
+  toolName: string,
+  options: McpDietOptions = {},
+  knownTools?: Map<string, McpToolDefinition>,
+): boolean {
+  const allowList = normalizePatternList(options.allow);
+  const denyList = normalizePatternList(options.deny);
+
+  if (
+    allowList.length > 0 &&
+    !allowList.some((p) => matchesPattern(toolName, p))
+  ) {
+    return false;
+  }
+
+  if (
+    denyList.length > 0 &&
+    denyList.some((p) => matchesPattern(toolName, p))
+  ) {
+    return false;
+  }
+
+  if (options.readOnly) {
+    const known = knownTools?.get(toolName);
+    if (known) {
+      return isReadOnlyTool(known);
+    }
+    return isReadOnlyTool({ name: toolName });
+  }
+
+  return true;
 }
 
 export function truncateDeterministic(text: string, maxChars: number): string {
@@ -127,14 +168,8 @@ export function filterToolsList(
   options: McpDietOptions = {},
 ): { tools: McpToolDefinition[]; stats: TreeShakeStats } {
   const originalSerialized = JSON.stringify(tools);
-  const allowList = (options.allow ?? [])
-    .flatMap((item) => item.split(","))
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const denyList = (options.deny ?? [])
-    .flatMap((item) => item.split(","))
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const allowList = normalizePatternList(options.allow);
+  const denyList = normalizePatternList(options.deny);
 
   const kept: McpToolDefinition[] = [];
   const removedTools: string[] = [];
@@ -218,7 +253,7 @@ export function redactSecretsInText(input: string): string {
       "$1***REDACTED***",
     )
     .replace(
-      /\b(sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{4})[A-Za-z0-9_-]{14,}\b/g,
+      /\b(sk-(?!ant-)(?:proj-|svcacct-)?[A-Za-z0-9_-]{4})[A-Za-z0-9_-]{14,}\b/g,
       "$1***REDACTED***",
     )
     .replace(
@@ -242,7 +277,7 @@ export function redactSecretsInText(input: string): string {
       "$1$2***REDACTED***",
     )
     .replace(
-      /\b(Bearer\s+[A-Za-z0-9._~+/-]{4})[A-Za-z0-9._~+/-]{16,}\b/gi,
+      /\b(Bearer\s+[A-Za-z0-9._~+/=-]{4})[A-Za-z0-9._~+/=-]{16,}/gi,
       "$1***REDACTED***",
     )
     .replace(
@@ -266,6 +301,32 @@ export function redactSecretsInValue(value: unknown): unknown {
     return out;
   }
   return value;
+}
+
+function summarizeContentItemForPreview(item: Record<string, unknown>): string {
+  if (typeof item.text === "string") {
+    return item.text;
+  }
+  if (
+    item.type === "resource" &&
+    item.resource &&
+    typeof item.resource === "object"
+  ) {
+    const res = item.resource as Record<string, unknown>;
+    if (typeof res.text === "string") {
+      return res.text;
+    }
+    if (typeof res.blob === "string") {
+      const uri = typeof res.uri === "string" ? res.uri : "unknown";
+      return `[binary resource blob (${res.blob.length} base64 chars, uri=${uri})]`;
+    }
+  }
+  if (item.type === "image" || item.type === "audio") {
+    const mime = typeof item.mimeType === "string" ? item.mimeType : "binary";
+    const dataLen = typeof item.data === "string" ? item.data.length : 0;
+    return `[${item.type} block (${mime}, ${dataLen} base64 chars)]`;
+  }
+  return "";
 }
 
 export async function guardToolCallResult(
@@ -306,15 +367,21 @@ export async function guardToolCallResult(
   await writeFile(spilledPath, serialized, "utf8");
 
   let previewText = serialized;
-  if (
-    processed &&
-    typeof processed === "object" &&
-    Array.isArray((processed as Record<string, unknown>).content)
-  ) {
-    const contentItems = (processed as Record<string, unknown>)
-      .content as Array<Record<string, unknown>>;
+  const processedRecord =
+    processed && typeof processed === "object"
+      ? (processed as Record<string, unknown>)
+      : null;
+
+  if (processedRecord && Array.isArray(processedRecord.content)) {
+    const contentItems = processedRecord.content as Array<
+      Record<string, unknown>
+    >;
     const joinedText = contentItems
-      .map((item) => (typeof item?.text === "string" ? item.text : ""))
+      .map((item) =>
+        item && typeof item === "object"
+          ? summarizeContentItemForPreview(item)
+          : "",
+      )
       .filter(Boolean)
       .join("\n");
     if (joinedText) {
@@ -329,6 +396,7 @@ export async function guardToolCallResult(
     spilledPath,
     originalBytes,
     result: {
+      ...(processedRecord?.isError === true ? { isError: true } : {}),
       content: [
         {
           type: "text",
@@ -353,6 +421,7 @@ export async function transformJsonRpcMessage(
   rawLine: string,
   options: McpDietOptions = {},
   pendingRequests?: Map<string | number, string>,
+  knownTools?: Map<string, McpToolDefinition>,
 ): Promise<string> {
   const trimmed = rawLine.trim();
   if (!trimmed.startsWith("{")) {
@@ -381,10 +450,15 @@ export async function transformJsonRpcMessage(
       : null;
 
   if (resultObj && Array.isArray(resultObj.tools)) {
-    const filtered = filterToolsList(
-      resultObj.tools as McpToolDefinition[],
-      options,
-    );
+    const rawTools = resultObj.tools as McpToolDefinition[];
+    if (knownTools) {
+      for (const tool of rawTools) {
+        if (tool && typeof tool.name === "string") {
+          knownTools.set(tool.name, tool);
+        }
+      }
+    }
+    const filtered = filterToolsList(rawTools, options);
     return JSON.stringify({
       ...parsed,
       result: {
@@ -412,7 +486,53 @@ export async function transformJsonRpcMessage(
     });
   }
 
-  return rawLine;
+  return JSON.stringify(parsed);
+}
+
+function resolveWindowsSpawn(
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): { command: string; args: string[]; shell: boolean } {
+  if (process.platform !== "win32") {
+    return { command, args, shell: false };
+  }
+  const lower = command.toLowerCase();
+  if (lower === "npx" || lower === "npm") {
+    const cliScript = join(
+      dirname(process.execPath),
+      "node_modules",
+      "npm",
+      "bin",
+      lower === "npx" ? "npx-cli.js" : "npm-cli.js",
+    );
+    if (existsSync(cliScript)) {
+      return {
+        command: process.execPath,
+        args: [cliScript, ...args],
+        shell: false,
+      };
+    }
+  }
+  if (lower.endsWith(".cmd") || lower.endsWith(".bat")) {
+    return { command, args, shell: true };
+  }
+  if (!lower.endsWith(".exe") && !lower.includes("/") && !lower.includes("\\")) {
+    const pathDirs = (env.PATH ?? env.Path ?? "").split(delimiter);
+    for (const dir of pathDirs) {
+      if (!dir) continue;
+      if (existsSync(join(dir, `${command}.exe`))) {
+        return { command, args, shell: false };
+      }
+      if (
+        existsSync(join(dir, `${command}.cmd`)) ||
+        existsSync(join(dir, `${command}.bat`))
+      ) {
+        return { command, args, shell: true };
+      }
+    }
+  }
+  return { command, args, shell: false };
 }
 
 export interface StdioProxyHandle {
@@ -432,15 +552,18 @@ export function startStdioMcpProxy(params: {
   const clientIn = params.clientIn ?? process.stdin;
   const clientOut = params.clientOut ?? process.stdout;
   const clientErr = params.clientErr ?? process.stderr;
+  const env = params.env ?? process.env;
 
-  const child = spawn(params.command, params.args, {
-    shell: false,
+  const resolved = resolveWindowsSpawn(params.command, params.args, env);
+  const child = spawn(resolved.command, resolved.args, {
+    shell: resolved.shell,
     windowsHide: true,
     stdio: ["pipe", "pipe", "pipe"],
-    env: params.env ?? process.env,
+    env,
   });
 
   const pendingRequests = new Map<string | number, string>();
+  const knownTools = new Map<string, McpToolDefinition>();
 
   const clientReader = createInterface({ input: clientIn });
   clientReader.on("line", (line) => {
@@ -448,11 +571,46 @@ export function startStdioMcpProxy(params: {
     if (trimmed.startsWith("{")) {
       try {
         const msg = JSON.parse(trimmed) as Record<string, unknown>;
-        if (
-          (typeof msg.id === "string" || typeof msg.id === "number") &&
-          typeof msg.method === "string"
-        ) {
-          pendingRequests.set(msg.id, msg.method);
+        const msgId =
+          typeof msg.id === "string" || typeof msg.id === "number"
+            ? msg.id
+            : undefined;
+        const msgMethod =
+          typeof msg.method === "string" ? msg.method : undefined;
+
+        if (msgMethod === "tools/call" && msgId !== undefined) {
+          const msgParams =
+            msg.params && typeof msg.params === "object"
+              ? (msg.params as Record<string, unknown>)
+              : null;
+          const toolName =
+            msgParams && typeof msgParams.name === "string"
+              ? msgParams.name
+              : null;
+          if (
+            toolName &&
+            !isToolCallAllowed(toolName, params.options, knownTools)
+          ) {
+            const blockedResponse = JSON.stringify({
+              jsonrpc: "2.0",
+              id: msgId,
+              result: {
+                isError: true,
+                content: [
+                  {
+                    type: "text",
+                    text: `[mcp-diet] Tool call "${toolName}" blocked by runtime firewall policy.`,
+                  },
+                ],
+              },
+            });
+            clientOut.write(`${blockedResponse}\n`);
+            return;
+          }
+        }
+
+        if (msgId !== undefined && msgMethod !== undefined) {
+          pendingRequests.set(msgId, msgMethod);
         }
       } catch {
         // Forward verbatim
@@ -470,20 +628,74 @@ export function startStdioMcpProxy(params: {
   });
 
   let stdoutQueue = Promise.resolve();
+  let multiLineBuffer: string[] = [];
+
+  const flushMultiLineRaw = () => {
+    if (multiLineBuffer.length === 0) return;
+    for (const raw of multiLineBuffer) {
+      clientOut.write(`${raw}\n`);
+    }
+    multiLineBuffer = [];
+  };
+
   const serverReader = createInterface({ input: child.stdout });
   serverReader.on("line", (line) => {
     stdoutQueue = stdoutQueue
       .then(async () => {
-        const transformed = await transformJsonRpcMessage(
-          line,
-          params.options,
-          pendingRequests,
-        );
-        clientOut.write(`${transformed}\n`);
+        const trimmed = line.trim();
+
+        if (multiLineBuffer.length === 0) {
+          if (!trimmed.startsWith("{")) {
+            clientOut.write(`${line}\n`);
+            return;
+          }
+          try {
+            JSON.parse(trimmed);
+            const transformed = await transformJsonRpcMessage(
+              trimmed,
+              params.options,
+              pendingRequests,
+              knownTools,
+            );
+            clientOut.write(`${transformed}\n`);
+            return;
+          } catch {
+            if (trimmed.endsWith("}")) {
+              clientOut.write(`${line}\n`);
+              return;
+            }
+            multiLineBuffer.push(line);
+            return;
+          }
+        }
+
+        multiLineBuffer.push(line);
+        const combined = multiLineBuffer.join("\n").trim();
+        try {
+          JSON.parse(combined);
+          multiLineBuffer = [];
+          const transformed = await transformJsonRpcMessage(
+            combined,
+            params.options,
+            pendingRequests,
+            knownTools,
+          );
+          clientOut.write(`${transformed}\n`);
+        } catch {
+          if (multiLineBuffer.length >= 128 || combined.length > 4_194_304) {
+            flushMultiLineRaw();
+          }
+        }
       })
       .catch(() => {
         clientOut.write(`${line}\n`);
       });
+  });
+
+  serverReader.on("close", () => {
+    stdoutQueue = stdoutQueue.then(() => {
+      flushMultiLineRaw();
+    });
   });
 
   child.stderr.on("data", (chunk: Buffer | string) => {
