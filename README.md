@@ -89,6 +89,14 @@ import {
 } from "@framy2/mcp-diet";
 ```
 
+## 🧩 Companion Tools / Ecosystem
+
+- **[`FramY2/ctxwise`](https://github.com/FramY2/ctxwise) (`@framy2/ctxwise`)**: Local-first AI Context Firewall, MCP Schema Tree-Shaker (`mcp-xray`, `mcp-prune`), multi-agent rule sync (`CLAUDE.md` ↔ `AGENTS.md` ↔ Cursor), Codex `32 KiB` doctor, and SARIF 2.1.0 Secret Shield.
+- **[`FramY2/agent-wire-tap`](https://github.com/FramY2/agent-wire-tap) (`@framy2/agent-wire-tap`)**: Zero-cost local loopback HTTP interceptor & CI context contract tester for `codex` and `claude` — verifies outbound system prompt markers, tool counts, and byte budgets with **$0.00 API cost**.
+- **[Interactive Context & MCP Token Tax Calculator](https://framy2.github.io/ctxwise/)**: 100% client-side web calculator for MCP schema token tax, 50-turn session costs, and secret scanning.
+
+---
+
 ## License
 
 MIT © [Christian Frascogna (@FramY2)](https://github.com/FramY2)
