@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -204,10 +204,19 @@ async function main(): Promise<void> {
   });
 }
 
-if (
-  process.argv[1] &&
-  fileURLToPath(import.meta.url) === resolve(process.argv[1])
-) {
+function isDirectExecution(): boolean {
+  if (!process.argv[1]) return false;
+  const selfPath = fileURLToPath(import.meta.url);
+  const argPath = resolve(process.argv[1]);
+  if (selfPath === argPath) return true;
+  try {
+    return realpathSync(selfPath) === realpathSync(argPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectExecution()) {
   main().catch((err: unknown) => {
     process.stderr.write(`mcp-diet error: ${(err as Error).message}\n`);
     process.exitCode = 1;

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -663,5 +663,34 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
     };
     expect(tools.id).toBe(2);
     expect(tools.result.tools.length).toBe(3);
+  });
+
+  it("executes CLI main() when invoked via a symlinked binary path (like node_modules/.bin/mcp-diet)", async () => {
+    const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+    const tsxCliPath = fileURLToPath(
+      new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url),
+    );
+    const dir = await mkdtemp(join(tmpdir(), "mcp-diet-symlink-"));
+    tempDirs.push(dir);
+    const linkPath = join(dir, "mcp-diet-bin.ts");
+    await symlink(cliPath, linkPath);
+
+    const out = await new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, [tsxCliPath, linkPath, "--version"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      let stdout = "";
+      child.stdout.on("data", (c: Buffer) => {
+        stdout += c.toString();
+      });
+      child.on("error", reject);
+      child.on("exit", (code) => {
+        if (code !== 0) reject(new Error(`Exited with code ${code}`));
+        else resolve(stdout.trim());
+      });
+    });
+
+    expect(out).toBe("0.1.1");
   });
 });

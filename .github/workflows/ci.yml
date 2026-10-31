@@ -34,3 +34,15 @@ jobs:
 
       - name: Run typecheck, unit & e2e tests, and build
         run: npm run check
+
+      - name: Build and verify Glama-compatible Docker image
+        if: matrix.node == 22
+        run: |
+          docker build -t mcp-diet:ci .
+          printf '%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+            | docker run --rm -i mcp-diet:ci | tee /tmp/docker-mcp-out.jsonl
+          grep -q '"@framy2/mcp-diet"' /tmp/docker-mcp-out.jsonl
+          grep -q '"mcp_diet_analyze_tools"' /tmp/docker-mcp-out.jsonl
+          docker run --rm --entrypoint mcp-diet mcp-diet:ci --version | grep -q '0.1.1'

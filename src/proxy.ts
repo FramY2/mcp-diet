@@ -922,6 +922,24 @@ export function startStandaloneMcpServer(params?: {
           return;
         }
 
+        if (method === "logging/setLevel") {
+          clientOut.write(
+            `${JSON.stringify({ jsonrpc: "2.0", id, result: {} })}\n`,
+          );
+          return;
+        }
+
+        if (method === "completion/complete") {
+          clientOut.write(
+            `${JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              result: { completion: { values: [] } },
+            })}\n`,
+          );
+          return;
+        }
+
         if (method === "tools/call") {
           const toolName =
             typeof msgParams.name === "string" ? msgParams.name : "";
