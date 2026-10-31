@@ -1,6 +1,6 @@
 {
   "name": "@framy2/mcp-diet",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Zero-dependency stdio MCP proxy and runtime context firewall: deterministic tools/list tree-shaking, oversized tools/call crash guard, and live secret redaction for Claude Code, OpenAI Codex, and Cursor.",
   "type": "module",
   "bin": {

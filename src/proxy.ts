@@ -710,3 +710,337 @@ export function startStdioMcpProxy(params: {
 
   return { child, close };
 }
+
+export const STANDALONE_MCP_TOOLS: McpToolDefinition[] = [
+  {
+    name: "mcp_diet_analyze_tools",
+    description:
+      "Analyze an array of MCP tool definitions and compute deterministic tree-shaking byte and token savings under mcp-diet policies.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tools: {
+          type: "array",
+          description: "Array of MCP tool definition objects to analyze.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string", description: "Tool name" },
+              description: { type: "string", description: "Tool description" },
+            },
+            required: ["name"],
+          },
+        },
+        readOnly: {
+          type: "boolean",
+          description: "Keep only read-only tools.",
+        },
+        maxDescChars: {
+          type: "number",
+          description: "Maximum description length in characters.",
+        },
+      },
+      required: ["tools"],
+    },
+    annotations: {
+      title: "Analyze MCP Tool Schemas",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "mcp_diet_redact_text",
+    description:
+      "Redact leaked API keys, GitHub PATs, AWS keys, connection URL passwords, bearer tokens, and private keys from text.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: {
+          type: "string",
+          description: "Input text to sanitize against secret leakage.",
+        },
+      },
+      required: ["text"],
+    },
+    annotations: {
+      title: "Redact Secrets in Text",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "mcp_diet_status",
+    description:
+      "Inspect the active mcp-diet runtime firewall configuration, version, and crash-guard thresholds.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+    annotations: {
+      title: "Inspect mcp-diet Firewall Policy",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+];
+
+export interface StandaloneServerHandle {
+  close: () => void;
+}
+
+export function startStandaloneMcpServer(params?: {
+  options?: McpDietOptions;
+  version?: string;
+  clientIn?: Readable;
+  clientOut?: Writable;
+}): StandaloneServerHandle {
+  const options = params?.options ?? {};
+  const version = params?.version ?? "0.1.1";
+  const clientIn = params?.clientIn ?? process.stdin;
+  const clientOut = params?.clientOut ?? process.stdout;
+
+  const knownTools = new Map<string, McpToolDefinition>(
+    STANDALONE_MCP_TOOLS.map((t) => [t.name, t]),
+  );
+
+  let queue = Promise.resolve();
+  const reader = createInterface({ input: clientIn });
+
+  reader.on("line", (line) => {
+    queue = queue
+      .then(async () => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("{")) {
+          return;
+        }
+
+        let msg: Record<string, unknown>;
+        try {
+          msg = JSON.parse(trimmed) as Record<string, unknown>;
+        } catch {
+          return;
+        }
+
+        const hasId =
+          typeof msg.id === "string" ||
+          typeof msg.id === "number" ||
+          msg.id === null;
+        if (!hasId) {
+          // JSON-RPC 2.0 notification (e.g. notifications/initialized)
+          return;
+        }
+
+        const id = msg.id;
+        const method = typeof msg.method === "string" ? msg.method : "";
+        const msgParams =
+          msg.params && typeof msg.params === "object"
+            ? (msg.params as Record<string, unknown>)
+            : {};
+
+        if (method === "initialize") {
+          const requestedProtocol =
+            typeof msgParams.protocolVersion === "string" &&
+            msgParams.protocolVersion.trim().length > 0
+              ? msgParams.protocolVersion
+              : "2024-11-05";
+          clientOut.write(
+            `${JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              result: {
+                protocolVersion: requestedProtocol,
+                capabilities: {
+                  tools: { listChanged: false },
+                  resources: { listChanged: false },
+                  prompts: { listChanged: false },
+                },
+                serverInfo: {
+                  name: "@framy2/mcp-diet",
+                  version,
+                },
+              },
+            })}\n`,
+          );
+          return;
+        }
+
+        if (method === "ping") {
+          clientOut.write(
+            `${JSON.stringify({ jsonrpc: "2.0", id, result: {} })}\n`,
+          );
+          return;
+        }
+
+        if (method === "tools/list") {
+          const filtered = filterToolsList(STANDALONE_MCP_TOOLS, options);
+          clientOut.write(
+            `${JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              result: { tools: filtered.tools },
+            })}\n`,
+          );
+          return;
+        }
+
+        if (method === "resources/list") {
+          clientOut.write(
+            `${JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              result: { resources: [] },
+            })}\n`,
+          );
+          return;
+        }
+
+        if (method === "resources/templates/list") {
+          clientOut.write(
+            `${JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              result: { resourceTemplates: [] },
+            })}\n`,
+          );
+          return;
+        }
+
+        if (method === "prompts/list") {
+          clientOut.write(
+            `${JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              result: { prompts: [] },
+            })}\n`,
+          );
+          return;
+        }
+
+        if (method === "tools/call") {
+          const toolName =
+            typeof msgParams.name === "string" ? msgParams.name : "";
+          const toolArgs =
+            msgParams.arguments && typeof msgParams.arguments === "object"
+              ? (msgParams.arguments as Record<string, unknown>)
+              : {};
+
+          if (!toolName || !isToolCallAllowed(toolName, options, knownTools)) {
+            clientOut.write(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                id,
+                result: {
+                  isError: true,
+                  content: [
+                    {
+                      type: "text",
+                      text: `[mcp-diet] Tool call "${toolName}" blocked by runtime firewall policy.`,
+                    },
+                  ],
+                },
+              })}\n`,
+            );
+            return;
+          }
+
+          let rawToolResult: Record<string, unknown>;
+          if (toolName === "mcp_diet_analyze_tools") {
+            const inputTools = Array.isArray(toolArgs.tools)
+              ? (toolArgs.tools as McpToolDefinition[])
+              : [];
+            const callOptions: McpDietOptions = {
+              ...options,
+              ...(typeof toolArgs.readOnly === "boolean"
+                ? { readOnly: toolArgs.readOnly }
+                : {}),
+              ...(typeof toolArgs.maxDescChars === "number"
+                ? { maxDescChars: toolArgs.maxDescChars }
+                : {}),
+            };
+            const analyzed = filterToolsList(inputTools, callOptions);
+            rawToolResult = {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(analyzed.stats, null, 2),
+                },
+              ],
+            };
+          } else if (toolName === "mcp_diet_redact_text") {
+            const text = typeof toolArgs.text === "string" ? toolArgs.text : "";
+            rawToolResult = {
+              content: [
+                {
+                  type: "text",
+                  text: redactSecretsInText(text),
+                },
+              ],
+            };
+          } else if (toolName === "mcp_diet_status") {
+            rawToolResult = {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      mode: "standalone",
+                      version,
+                      options,
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          } else {
+            rawToolResult = {
+              isError: true,
+              content: [
+                {
+                  type: "text",
+                  text: `[mcp-diet] Unknown tool: ${toolName}`,
+                },
+              ],
+            };
+          }
+
+          const guarded = await guardToolCallResult(rawToolResult, options);
+          clientOut.write(
+            `${JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              result: guarded.result,
+            })}\n`,
+          );
+          return;
+        }
+
+        clientOut.write(
+          `${JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            error: {
+              code: -32601,
+              message: `Method not found: ${method}`,
+            },
+          })}\n`,
+        );
+      })
+      .catch(() => {
+        // Ignore unexpected line handling errors
+      });
+  });
+
+  const close = () => {
+    reader.close();
+  };
+
+  return { close };
+}

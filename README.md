@@ -63,6 +63,7 @@ Replace your MCP server command in `.mcp.json` or `~/.claude.json`:
 ```text
 Usage:
   mcp-diet [options] -- <server-command> [server-args...]
+  mcp-diet [options] --self-test-server
 
 Options:
   --allow <t1,t2>         Allow only matching tool names or wildcard patterns (e.g. get_*,list_*)
@@ -72,6 +73,7 @@ Options:
   --max-result-kb <kb>    Spill oversized tools/call results to a temp file (default: 512)
   --redact-secrets        Redact leaked API keys, PATs, and credentials in tools/call output
   --spill-dir <dir>       Custom directory for spilled oversized tool outputs
+  --self-test-server      Run standalone diagnostic MCP server over stdio (for introspection/Glama)
   -v, --version           Print version
   -h, --help              Print help
 ```
@@ -85,6 +87,7 @@ import {
   filterToolsList,
   guardToolCallResult,
   redactSecretsInText,
+  startStandaloneMcpServer,
   startStdioMcpProxy,
 } from "@framy2/mcp-diet";
 ```

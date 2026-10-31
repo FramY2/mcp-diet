@@ -1,7 +1,9 @@
+import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -11,6 +13,7 @@ import {
   guardToolCallResult,
   isReadOnlyTool,
   redactSecretsInText,
+  startStandaloneMcpServer,
   startStdioMcpProxy,
   transformJsonRpcMessage,
   type McpToolDefinition,
@@ -434,5 +437,231 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
       "-y",
       "@modelcontextprotocol/server-github",
     ]);
+
+    const standaloneParsed = parseCliArgs(["--self-test-server", "--read-only"]);
+    expect(standaloneParsed.selfTestServer).toBe(true);
+    expect(standaloneParsed.options.readOnly).toBe(true);
+    expect(standaloneParsed.command).toBeNull();
+  });
+
+  it("serves standalone MCP introspection requests (initialize, tools/list, resources/list, prompts/list, tools/call)", async () => {
+    const clientIn = new PassThrough();
+    const clientOut = new PassThrough();
+    const server = startStandaloneMcpServer({
+      options: { redactSecrets: true },
+      version: "0.1.1",
+      clientIn,
+      clientOut,
+    });
+
+    const lines: string[] = [];
+    const waitForLines = (count: number) =>
+      new Promise<void>((resolve) => {
+        const check = () => {
+          if (lines.length >= count) resolve();
+        };
+        check();
+        clientOut.on("data", (chunk: Buffer) => {
+          for (const l of chunk.toString().split(/\r?\n/)) {
+            if (l.trim()) lines.push(l.trim());
+          }
+          check();
+        });
+      });
+
+    clientIn.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "glama-scanner", version: "1.0.0" },
+        },
+      })}\n`,
+    );
+    clientIn.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/initialized",
+      })}\n`,
+    );
+    clientIn.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list",
+        params: {},
+      })}\n`,
+    );
+    clientIn.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "resources/list",
+        params: {},
+      })}\n`,
+    );
+    clientIn.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 4,
+        method: "prompts/list",
+        params: {},
+      })}\n`,
+    );
+    clientIn.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/call",
+        params: {
+          name: "mcp_diet_analyze_tools",
+          arguments: {
+            tools: SAMPLE_TOOLS,
+            readOnly: true,
+          },
+        },
+      })}\n`,
+    );
+    clientIn.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 6,
+        method: "tools/call",
+        params: {
+          name: "mcp_diet_redact_text",
+          arguments: {
+            text: "Leaked key: sk-ant-api03-1234567890abcdefghijklmnop",
+          },
+        },
+      })}\n`,
+    );
+
+    await waitForLines(6);
+    server.close();
+
+    const initResp = JSON.parse(lines[0]!) as {
+      id: number;
+      result: {
+        protocolVersion: string;
+        serverInfo: { name: string; version: string };
+      };
+    };
+    expect(initResp.id).toBe(1);
+    expect(initResp.result.protocolVersion).toBe("2025-03-26");
+    expect(initResp.result.serverInfo.name).toBe("@framy2/mcp-diet");
+    expect(initResp.result.serverInfo.version).toBe("0.1.1");
+
+    const toolsResp = JSON.parse(lines[1]!) as {
+      id: number;
+      result: { tools: McpToolDefinition[] };
+    };
+    expect(toolsResp.id).toBe(2);
+    expect(toolsResp.result.tools.map((t) => t.name)).toEqual([
+      "mcp_diet_analyze_tools",
+      "mcp_diet_redact_text",
+      "mcp_diet_status",
+    ]);
+
+    const resResp = JSON.parse(lines[2]!) as {
+      id: number;
+      result: { resources: unknown[] };
+    };
+    expect(resResp.id).toBe(3);
+    expect(resResp.result.resources).toEqual([]);
+
+    const promptsResp = JSON.parse(lines[3]!) as {
+      id: number;
+      result: { prompts: unknown[] };
+    };
+    expect(promptsResp.id).toBe(4);
+    expect(promptsResp.result.prompts).toEqual([]);
+
+    const analyzeResp = JSON.parse(lines[4]!) as {
+      id: number;
+      result: { content: Array<{ text: string }> };
+    };
+    expect(analyzeResp.id).toBe(5);
+    const stats = JSON.parse(analyzeResp.result.content[0]!.text) as {
+      originalCount: number;
+      keptCount: number;
+      removedTools: string[];
+    };
+    expect(stats.originalCount).toBe(3);
+    expect(stats.keptCount).toBe(2);
+    expect(stats.removedTools).toEqual(["delete_repository"]);
+
+    const redactResp = JSON.parse(lines[5]!) as {
+      id: number;
+      result: { content: Array<{ text: string }> };
+    };
+    expect(redactResp.id).toBe(6);
+    expect(redactResp.result.content[0]!.text).toContain("***REDACTED***");
+    expect(redactResp.result.content[0]!.text).not.toContain(
+      "1234567890abcdefghijklmnop",
+    );
+  });
+
+  it("responds to MCP initialize + tools/list when CLI is invoked without a downstream command over non-TTY stdio", async () => {
+    const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+    const tsxCliPath = fileURLToPath(
+      new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url),
+    );
+    const child = spawn(process.execPath, [tsxCliPath, cliPath], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    const lines: string[] = [];
+    const waitForLines = (count: number) =>
+      new Promise<void>((resolve) => {
+        const check = () => {
+          if (lines.length >= count) resolve();
+        };
+        check();
+        child.stdout.on("data", (chunk: Buffer) => {
+          for (const l of chunk.toString().split(/\r?\n/)) {
+            if (l.trim()) lines.push(l.trim());
+          }
+          check();
+        });
+      });
+
+    child.stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {} },
+      })}\n`,
+    );
+    child.stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list",
+        params: {},
+      })}\n`,
+    );
+
+    await waitForLines(2);
+    child.stdin.end();
+    child.kill();
+
+    const init = JSON.parse(lines[0]!) as {
+      id: number;
+      result: { serverInfo: { name: string } };
+    };
+    expect(init.id).toBe(1);
+    expect(init.result.serverInfo.name).toBe("@framy2/mcp-diet");
+
+    const tools = JSON.parse(lines[1]!) as {
+      id: number;
+      result: { tools: McpToolDefinition[] };
+    };
+    expect(tools.id).toBe(2);
+    expect(tools.result.tools.length).toBe(3);
   });
 });

@@ -5,11 +5,16 @@ import { resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { startStdioMcpProxy, type McpDietOptions } from "./proxy.js";
+import {
+  startStandaloneMcpServer,
+  startStdioMcpProxy,
+  type McpDietOptions,
+} from "./proxy.js";
 
 export interface ParsedCliArgs {
   help: boolean;
   version: boolean;
+  selfTestServer: boolean;
   options: McpDietOptions;
   command: string | null;
   commandArgs: string[];
@@ -25,6 +30,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   let spillDir: string | undefined;
   let help = false;
   let version = false;
+  let selfTestServer = false;
 
   let command: string | null = null;
   const commandArgs: string[] = [];
@@ -47,6 +53,8 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       help = true;
     } else if (arg === "--version" || arg === "-v") {
       version = true;
+    } else if (arg === "--self-test-server" || arg === "--standalone") {
+      selfTestServer = true;
     } else if (arg === "--read-only") {
       readOnly = true;
     } else if (arg === "--redact-secrets") {
@@ -103,6 +111,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   return {
     help,
     version,
+    selfTestServer,
     options: {
       allow,
       deny,
@@ -122,9 +131,9 @@ function getVersion(): string {
     const pkg = JSON.parse(
       readFileSync(new URL("../package.json", import.meta.url), "utf8"),
     ) as { version?: string };
-    return pkg.version ?? "0.1.0";
+    return pkg.version ?? "0.1.1";
   } catch {
-    return "0.1.0";
+    return "0.1.1";
   }
 }
 
@@ -135,6 +144,7 @@ function printHelp(): void {
       "",
       "Usage:",
       "  mcp-diet [options] -- <server-command> [server-args...]",
+      "  mcp-diet [options] --self-test-server",
       "",
       "Options:",
       "  --allow <t1,t2>         Allow only matching tool names or wildcard patterns",
@@ -144,6 +154,7 @@ function printHelp(): void {
       "  --max-result-kb <kb>    Spill oversized tools/call results to a temp file (default: 512)",
       "  --redact-secrets        Redact leaked API keys, PATs, and credentials in tools/call output",
       "  --spill-dir <dir>       Custom directory for spilled oversized tool outputs",
+      "  --self-test-server      Run standalone diagnostic MCP server over stdio (for introspection/Glama)",
       "  -v, --version           Print version",
       "  -h, --help              Print help",
       "",
@@ -159,6 +170,17 @@ async function main(): Promise<void> {
   }
   if (parsed.version) {
     process.stdout.write(`${getVersion()}\n`);
+    return;
+  }
+  if (
+    parsed.selfTestServer ||
+    (!parsed.command &&
+      (process.env.MCP_DIET_STANDALONE === "1" || !process.stdin.isTTY))
+  ) {
+    startStandaloneMcpServer({
+      options: parsed.options,
+      version: getVersion(),
+    });
     return;
   }
   if (!parsed.command) {
