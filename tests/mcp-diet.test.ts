@@ -9,6 +9,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { parseCliArgs } from "../src/cli.js";
 import {
+  buildSpillStructureMap,
+  executeReadSpillTool,
   filterToolsList,
   guardToolCallResult,
   isReadOnlyTool,
@@ -193,7 +195,11 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
     const parsedList = JSON.parse(filteredLine) as {
       result: { tools: McpToolDefinition[] };
     };
-    expect(parsedList.result.tools).toHaveLength(2);
+    expect(parsedList.result.tools.map((t) => t.name)).toEqual([
+      "get_pull_request",
+      "list_issues",
+      "mcp_diet_read_spill",
+    ]);
 
     const callLine = JSON.stringify({
       jsonrpc: "2.0",
@@ -276,7 +282,10 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
       result: { tools: McpToolDefinition[] };
     };
     expect(parsed.id).toBe(10);
-    expect(parsed.result.tools.map((t) => t.name)).toEqual(["read_file"]);
+    expect(parsed.result.tools.map((t) => t.name)).toEqual([
+      "mcp_diet_read_spill",
+      "read_file",
+    ]);
   });
 
   it("blocks forbidden tools/call requests at the firewall and handles multi-line JSON + stdout banners", async () => {
@@ -326,18 +335,25 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
     });
 
     const lines: string[] = [];
+    const pendingWaiters: Array<{ count: number; resolve: () => void }> = [];
+    clientOut.on("data", (chunk: Buffer) => {
+      for (const l of chunk.toString().split(/\r?\n/)) {
+        if (l.trim()) lines.push(l.trim());
+      }
+      for (let i = pendingWaiters.length - 1; i >= 0; i--) {
+        if (lines.length >= pendingWaiters[i]!.count) {
+          pendingWaiters[i]!.resolve();
+          pendingWaiters.splice(i, 1);
+        }
+      }
+    });
     const waitForLines = (count: number) =>
       new Promise<void>((resolve) => {
-        const check = () => {
-          if (lines.length >= count) resolve();
-        };
-        check();
-        clientOut.on("data", (chunk: Buffer) => {
-          for (const l of chunk.toString().split(/\r?\n/)) {
-            if (l.trim()) lines.push(l.trim());
-          }
-          check();
-        });
+        if (lines.length >= count) {
+          resolve();
+          return;
+        }
+        pendingWaiters.push({ count, resolve });
       });
 
     clientIn.write(
@@ -349,7 +365,10 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
     const listResp = JSON.parse(lines[1]!) as {
       result: { tools: McpToolDefinition[] };
     };
-    expect(listResp.result.tools.map((t) => t.name)).toEqual(["read_file"]);
+    expect(listResp.result.tools.map((t) => t.name)).toEqual([
+      "mcp_diet_read_spill",
+      "read_file",
+    ]);
 
     // Attempt a forbidden tools/call to delete_file -> blocked by firewall without hitting server
     clientIn.write(
@@ -449,24 +468,31 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
     const clientOut = new PassThrough();
     const server = startStandaloneMcpServer({
       options: { redactSecrets: true },
-      version: "0.1.1",
+      version: "0.2.0",
       clientIn,
       clientOut,
     });
 
     const lines: string[] = [];
+    const pendingWaiters: Array<{ count: number; resolve: () => void }> = [];
+    clientOut.on("data", (chunk: Buffer) => {
+      for (const l of chunk.toString().split(/\r?\n/)) {
+        if (l.trim()) lines.push(l.trim());
+      }
+      for (let i = pendingWaiters.length - 1; i >= 0; i--) {
+        if (lines.length >= pendingWaiters[i]!.count) {
+          pendingWaiters[i]!.resolve();
+          pendingWaiters.splice(i, 1);
+        }
+      }
+    });
     const waitForLines = (count: number) =>
       new Promise<void>((resolve) => {
-        const check = () => {
-          if (lines.length >= count) resolve();
-        };
-        check();
-        clientOut.on("data", (chunk: Buffer) => {
-          for (const l of chunk.toString().split(/\r?\n/)) {
-            if (l.trim()) lines.push(l.trim());
-          }
-          check();
-        });
+        if (lines.length >= count) {
+          resolve();
+          return;
+        }
+        pendingWaiters.push({ count, resolve });
       });
 
     clientIn.write(
@@ -552,7 +578,7 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
     expect(initResp.id).toBe(1);
     expect(initResp.result.protocolVersion).toBe("2025-03-26");
     expect(initResp.result.serverInfo.name).toBe("@framy2/mcp-diet");
-    expect(initResp.result.serverInfo.version).toBe("0.1.1");
+    expect(initResp.result.serverInfo.version).toBe("0.2.0");
 
     const toolsResp = JSON.parse(lines[1]!) as {
       id: number;
@@ -561,6 +587,7 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
     expect(toolsResp.id).toBe(2);
     expect(toolsResp.result.tools.map((t) => t.name)).toEqual([
       "mcp_diet_analyze_tools",
+      "mcp_diet_read_spill",
       "mcp_diet_redact_text",
       "mcp_diet_status",
     ]);
@@ -662,7 +689,7 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
       result: { tools: McpToolDefinition[] };
     };
     expect(tools.id).toBe(2);
-    expect(tools.result.tools.length).toBe(3);
+    expect(tools.result.tools.length).toBe(4);
   });
 
   it("executes CLI main() when invoked via a symlinked binary path (like node_modules/.bin/mcp-diet)", async () => {
@@ -691,6 +718,507 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
       });
     });
 
-    expect(out).toBe("0.1.1");
+    expect(out).toBe("0.2.0");
+  });
+});
+
+describe("mcp-diet v0.2.0 — structured spill offset maps and sandboxed mcp_diet_read_spill", () => {
+  it("builds JSON object and array spill structure maps with 1-based lines, UTF-8 byte spans, and tail preview", () => {
+    const payload = {
+      metadata: { source: "github 🚀", ok: true },
+      results: Array.from({ length: 420 }, (_, i) => ({
+        id: i,
+        title: `Issue #${i} — details`,
+      })),
+      total: 420,
+    };
+    const prettyJson = JSON.stringify(payload, null, 2);
+    const map = buildSpillStructureMap(prettyJson);
+
+    expect(map.totalBytes).toBe(Buffer.byteLength(prettyJson, "utf8"));
+    expect(map.totalLines).toBeGreaterThan(1000);
+    expect(map.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(map.headPreview.length).toBe(1200);
+    expect(map.tailPreview?.length).toBe(400);
+    expect(map.sections).toHaveLength(3);
+    expect(map.sections[0]?.kind).toBe("json-key");
+    expect(map.sections[0]?.label).toBe("metadata (object)");
+    expect(map.sections[0]?.startLine).toBe(2);
+    expect(map.sections[1]?.label).toBe("results (array[420])");
+    expect(map.sections[2]?.label).toBe("total (number)");
+
+    const rawBuf = Buffer.from(prettyJson, "utf8");
+    const metaSlice = rawBuf
+      .subarray(map.sections[0]!.startByte, map.sections[0]!.endByte)
+      .toString("utf8");
+    expect(metaSlice).toContain('"source": "github 🚀"');
+
+    // Large JSON array chunks capped at maxEntries
+    const arrayJson = JSON.stringify(
+      Array.from({ length: 65 }, (_, i) => ({ index: i })),
+      null,
+      2,
+    );
+    const arrayMap = buildSpillStructureMap(arrayJson, 10);
+    expect(arrayMap.sections.length).toBeLessThanOrEqual(10);
+    expect(arrayMap.sections[0]?.kind).toBe("json-item");
+    expect(arrayMap.sections[0]?.label).toContain("items[0..");
+
+    // Small payload <= 1600 chars omits tailPreview
+    const smallArrayJson = JSON.stringify([{ a: 1 }, "two"]);
+    const smallMap = buildSpillStructureMap(smallArrayJson);
+    expect(smallMap.tailPreview).toBeUndefined();
+    expect(smallMap.sections.map((s) => s.label)).toEqual([
+      "[0] (object)",
+      "[1] (string)",
+    ]);
+  });
+
+  it("builds Markdown heading and log-block spill structure maps up to 20 entries", () => {
+    const mdLines: string[] = [];
+    for (let i = 1; i <= 25; i++) {
+      mdLines.push(`## Section ${i}`);
+      mdLines.push(`Line A of section ${i} with UTF-8 café`);
+      mdLines.push(`Line B of section ${i}`);
+    }
+    const mdText = mdLines.join("\n");
+    const mdMap = buildSpillStructureMap(mdText);
+
+    expect(mdMap.sections).toHaveLength(20);
+    expect(mdMap.sections[0]?.kind).toBe("heading");
+    expect(mdMap.sections[0]?.label).toBe("## Section 1");
+    expect(mdMap.sections[0]?.startLine).toBe(1);
+    expect(mdMap.sections[0]?.endLine).toBe(3);
+    expect(mdMap.sections[1]?.startLine).toBe(4);
+    expect(mdMap.sections[1]?.endLine).toBe(6);
+
+    const mdBuf = Buffer.from(mdText, "utf8");
+    expect(
+      mdBuf
+        .subarray(mdMap.sections[0]!.startByte, mdMap.sections[0]!.endByte)
+        .toString("utf8"),
+    ).toContain("## Section 1");
+
+    const logText = [
+      "[2026-11-14T09:00:00Z] Boot sequence started",
+      "service=api port=8080",
+      "WARN Cache miss ratio above threshold",
+      "cache=redis key=session:42",
+      "ERROR Failed to connect to replica",
+      "retry=3",
+      "=== Summary ===",
+      "FAIL 1 check failed",
+    ].join("\n");
+    const logMap = buildSpillStructureMap(logText);
+    expect(logMap.sections).toHaveLength(5);
+    expect(logMap.sections.every((s) => s.kind === "log-block")).toBe(true);
+    expect(logMap.sections[1]?.label).toContain("WARN Cache miss");
+    expect(logMap.sections[2]?.label).toContain("ERROR Failed");
+    expect(logMap.sections[2]?.startLine).toBe(5);
+    expect(logMap.sections[2]?.endLine).toBe(6);
+  });
+
+  it("enriches guardToolCallResult output and _mcpDietSpilled with offset index and previews", async () => {
+    const spillDir = await mkdtemp(join(tmpdir(), "mcp-diet-map-"));
+    tempDirs.push(spillDir);
+
+    const mdPayload = [
+      "# Report Overview",
+      "Intro paragraph ".repeat(80),
+      "## Findings",
+      "Detail line ".repeat(120),
+      "## Conclusion",
+      "Final tail marker XYZ_END",
+    ].join("\n");
+
+    const guarded = await guardToolCallResult(
+      { content: [{ type: "text", text: mdPayload }] },
+      { maxResultKb: 2, spillDir },
+    );
+
+    const resultObj = guarded.result as {
+      content: Array<{ type: string; text: string }>;
+      _mcpDietSpilled: {
+        path: string;
+        originalBytes: number;
+        maxBytes: number;
+        totalLines: number;
+        sha256: string;
+        sections: Array<{ label: string; kind: string }>;
+      };
+    };
+
+    const text = resultObj.content[0]!.text;
+    expect(text).toContain("totalBytes=");
+    expect(text).toContain("totalLines=6");
+    expect(text).toContain("sha256=");
+    expect(text).toContain("Structural Section & Offset Index:");
+    expect(text).toContain("[L1-L2 | bytes ");
+    expect(text).toContain("# Report Overview");
+    expect(text).toContain("Head Preview");
+    expect(text).toContain("Tail Preview");
+    expect(text).toContain("Final tail marker XYZ_END");
+    expect(text).toContain("mcp_diet_read_spill");
+
+    expect(resultObj._mcpDietSpilled.path).toBe(guarded.spilledPath);
+    expect(resultObj._mcpDietSpilled.originalBytes).toBeGreaterThan(2048);
+    expect(resultObj._mcpDietSpilled.maxBytes).toBe(2048);
+    expect(resultObj._mcpDietSpilled.totalLines).toBe(6);
+    expect(resultObj._mcpDietSpilled.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(resultObj._mcpDietSpilled.sections.map((s) => s.label)).toEqual([
+      "# Report Overview",
+      "## Findings",
+      "## Conclusion",
+    ]);
+  });
+
+  it("supports line slicing, byte slicing, RFC 6901 jsonPointer, capping, and default secret redaction in executeReadSpillTool", async () => {
+    const spillDir = await mkdtemp(join(tmpdir(), "mcp-diet-read-"));
+    tempDirs.push(spillDir);
+
+    const data = {
+      meta: { secret: "sk-ant-api03-1234567890abcdefghijklmnop" },
+      "a/b": { "c~d": "escaped-pointer-ok" },
+      results: [
+        { id: 10, title: "First item 🚀" },
+        { id: 20, title: "Second item", body: "Z".repeat(5000) },
+      ],
+    };
+    const spillFile = join(spillDir, "mcp-tool-output-1700000000000-abcdef012345.json");
+    const pretty = JSON.stringify(data, null, 2);
+    await writeFile(spillFile, pretty, "utf8");
+
+    // 1. 1-based line slicing + default secret redaction
+    const lineRes = executeReadSpillTool(
+      { path: spillFile, startLine: 1, endLine: 4 },
+      { spillDir },
+    );
+    expect(lineRes.isError).toBeUndefined();
+    expect(lineRes.content[0]?.text).toContain("***REDACTED***");
+    expect(lineRes.content[0]?.text).not.toContain("1234567890abcdefghijklmnop");
+
+    // Opt-out redaction when redactSecrets: false
+    const unredacted = executeReadSpillTool(
+      { path: spillFile, startLine: 1, endLine: 4 },
+      { spillDir, redactSecrets: false },
+    );
+    expect(unredacted.content[0]?.text).toContain("1234567890abcdefghijklmnop");
+
+    // 2. offsetBytes + maxBytes slicing capped at limitBytes
+    const byteRes = executeReadSpillTool(
+      { path: spillFile, offsetBytes: 0, maxBytes: 10_000 },
+      { spillDir, maxResultKb: 1 },
+    );
+    expect(byteRes.isError).toBeUndefined();
+    expect(
+      Buffer.byteLength(byteRes.content[0]!.text, "utf8"),
+    ).toBeLessThanOrEqual(1024);
+
+    // 3. RFC 6901 jsonPointer resolution including ~1 and ~0 escaping
+    const ptrRes = executeReadSpillTool(
+      { path: spillFile, jsonPointer: "/results/0/title" },
+      { spillDir },
+    );
+    expect(ptrRes.isError).toBeUndefined();
+    expect(ptrRes.content[0]?.text).toBe("First item 🚀");
+
+    const escapedPtrRes = executeReadSpillTool(
+      { path: spillFile, jsonPointer: "/a~1b/c~0d" },
+      { spillDir },
+    );
+    expect(escapedPtrRes.isError).toBeUndefined();
+    expect(escapedPtrRes.content[0]?.text).toBe("escaped-pointer-ok");
+
+    // Missing JSON pointer returns isError
+    const missingPtr = executeReadSpillTool(
+      { path: spillFile, jsonPointer: "/results/999" },
+      { spillDir },
+    );
+    expect(missingPtr.isError).toBe(true);
+
+    // Prototype pollution guard
+    const protoPtr = executeReadSpillTool(
+      { path: spillFile, jsonPointer: "/__proto__/polluted" },
+      { spillDir },
+    );
+    expect(protoPtr.isError).toBe(true);
+
+    // 4. End-to-end compatibility with guardToolCallResult MCP envelope
+    const mdGuarded = await guardToolCallResult(
+      {
+        content: [
+          {
+            type: "text",
+            text: "# Alpha\nalpha-1\nalpha-2\n## Beta\nbeta-1\nbeta-2\n" + "x".repeat(4000),
+          },
+        ],
+      },
+      { maxResultKb: 2, spillDir },
+    );
+    const envelopeLineSlice = executeReadSpillTool(
+      { path: mdGuarded.spilledPath!, startLine: 4, endLine: 6 },
+      { spillDir },
+    );
+    expect(envelopeLineSlice.isError).toBeUndefined();
+    expect(envelopeLineSlice.content[0]?.text).toBe("## Beta\nbeta-1\nbeta-2");
+  });
+
+  it("enforces strict realpathSync sandbox against traversal, arbitrary paths, invalid filenames, and escaping symlinks", async () => {
+    const baseDir = await mkdtemp(join(tmpdir(), "mcp-diet-sandbox-"));
+    tempDirs.push(baseDir);
+    const spillDir = join(baseDir, "spills");
+    const outsideDir = join(baseDir, "outside");
+    const { mkdir: fsMkdir } = await import("node:fs/promises");
+    await fsMkdir(spillDir, { recursive: true });
+    await fsMkdir(outsideDir, { recursive: true });
+
+    const outsideFile = join(outsideDir, "mcp-tool-output-123-abcdef012345.json");
+    await writeFile(outsideFile, '{"secret":"outside"}', "utf8");
+
+    const badNameInside = join(spillDir, "not-a-spill-file.json");
+    await writeFile(badNameInside, '{"secret":"badname"}', "utf8");
+
+    const escapingSymlink = join(
+      spillDir,
+      "mcp-tool-output-999-abcdef012345.json",
+    );
+    await symlink(outsideFile, escapingSymlink);
+
+    const badTargetSymlink = join(
+      spillDir,
+      "mcp-tool-output-888-abcdef012345.json",
+    );
+    await symlink(badNameInside, badTargetSymlink);
+
+    const traversalPath = join(
+      spillDir,
+      "..",
+      "outside",
+      "mcp-tool-output-123-abcdef012345.json",
+    );
+    const missingFile = join(
+      spillDir,
+      "mcp-tool-output-777-abcdef012345.json",
+    );
+
+    for (const badPath of [
+      outsideFile,
+      badNameInside,
+      escapingSymlink,
+      badTargetSymlink,
+      traversalPath,
+      missingFile,
+      spillDir,
+      "",
+    ]) {
+      const res = executeReadSpillTool({ path: badPath }, { spillDir });
+      expect(res.isError).toBe(true);
+      expect(res.content[0]?.text).toMatch(/^Access denied:/);
+    }
+  });
+
+  it("injects mcp_diet_read_spill under --read-only, intercepts tools/call locally without hitting child, and respects --no-spill-reader", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "mcp-diet-proxy-spill-"));
+    tempDirs.push(dir);
+    const spillDir = join(dir, "spills");
+    const childReceivedPath = join(dir, "child-calls.jsonl");
+    const fakeServerPath = join(dir, "fake-big-server.mjs");
+
+    await writeFile(
+      fakeServerPath,
+      [
+        'import { appendFileSync } from "node:fs";',
+        'import { createInterface } from "node:readline";',
+        `const logPath = ${JSON.stringify(childReceivedPath)};`,
+        "const rl = createInterface({ input: process.stdin });",
+        'rl.on("line", (line) => {',
+        "  appendFileSync(logPath, line + '\\n', 'utf8');",
+        "  const msg = JSON.parse(line);",
+        '  if (msg.method === "tools/list") {',
+        "    process.stdout.write(JSON.stringify({",
+        '      jsonrpc: "2.0",',
+        "      id: msg.id,",
+        "      result: {",
+        "        tools: [",
+        '          { name: "get_logs", description: "Fetch build logs", annotations: { readOnlyHint: true } },',
+        '          { name: "drop_db", description: "Drop database", annotations: { destructiveHint: true } }',
+        "        ]",
+        "      }",
+        '    }) + "\\n");',
+        "  }",
+        '  if (msg.method === "tools/call") {',
+        '    const bigText = "# Build Start\\nline-1\\n## Errors\\nERROR timeout on db\\n" + "z".repeat(6000);',
+        "    process.stdout.write(JSON.stringify({",
+        '      jsonrpc: "2.0",',
+        "      id: msg.id,",
+        '      result: { content: [{ type: "text", text: bigText }] }',
+        '    }) + "\\n");',
+        "  }",
+        "});",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const clientIn = new PassThrough();
+    const clientOut = new PassThrough();
+    const proxy = startStdioMcpProxy({
+      command: process.execPath,
+      args: [fakeServerPath],
+      options: { readOnly: true, maxResultKb: 2, spillDir },
+      clientIn,
+      clientOut,
+    });
+
+    const lines: string[] = [];
+    const pendingWaiters: Array<{ count: number; resolve: () => void }> = [];
+    clientOut.on("data", (chunk: Buffer) => {
+      for (const l of chunk.toString().split(/\r?\n/)) {
+        if (l.trim()) lines.push(l.trim());
+      }
+      for (let i = pendingWaiters.length - 1; i >= 0; i--) {
+        if (lines.length >= pendingWaiters[i]!.count) {
+          pendingWaiters[i]!.resolve();
+          pendingWaiters.splice(i, 1);
+        }
+      }
+    });
+    const waitForLines = (count: number) =>
+      new Promise<void>((resolve) => {
+        if (lines.length >= count) {
+          resolve();
+          return;
+        }
+        pendingWaiters.push({ count, resolve });
+      });
+
+    clientIn.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })}\n`,
+    );
+    await waitForLines(1);
+
+    const listResp = JSON.parse(lines[0]!) as {
+      result: { tools: McpToolDefinition[] };
+    };
+    expect(listResp.result.tools.map((t) => t.name)).toEqual([
+      "get_logs",
+      "mcp_diet_read_spill",
+    ]);
+    const spillTool = listResp.result.tools.find(
+      (t) => t.name === "mcp_diet_read_spill",
+    );
+    expect(spillTool?.annotations?.readOnlyHint).toBe(true);
+
+    // Call get_logs -> triggers spill with offset map
+    clientIn.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "get_logs", arguments: {} },
+      })}\n`,
+    );
+    await waitForLines(2);
+
+    const callResp = JSON.parse(lines[1]!) as {
+      result: {
+        _mcpDietSpilled: { path: string };
+        content: Array<{ text: string }>;
+      };
+    };
+    const spilledPath = callResp.result._mcpDietSpilled.path;
+    expect(callResp.result.content[0]?.text).toContain("## Errors");
+
+    // Now invoke mcp_diet_read_spill locally through the proxy
+    clientIn.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "mcp_diet_read_spill",
+          arguments: { path: spilledPath, startLine: 3, endLine: 4 },
+        },
+      })}\n`,
+    );
+    await waitForLines(3);
+    proxy.close();
+
+    const readResp = JSON.parse(lines[2]!) as {
+      id: number;
+      result: { isError?: boolean; content: Array<{ text: string }> };
+    };
+    expect(readResp.id).toBe(3);
+    expect(readResp.result.isError).toBeUndefined();
+    expect(readResp.result.content[0]?.text).toBe(
+      "## Errors\nERROR timeout on db",
+    );
+
+    // Verify child stdin NEVER received mcp_diet_read_spill
+    const childLog = await readFile(childReceivedPath, "utf8");
+    expect(childLog).toContain("get_logs");
+    expect(childLog).not.toContain("mcp_diet_read_spill");
+
+    // Verify --no-spill-reader CLI parsing and proxy opt-out
+    const noReaderParsed = parseCliArgs([
+      "--no-spill-reader",
+      "--",
+      "node",
+      "server.js",
+    ]);
+    expect(noReaderParsed.options.disableSpillReader).toBe(true);
+
+    const noReaderIn = new PassThrough();
+    const noReaderOut = new PassThrough();
+    const noReaderProxy = startStdioMcpProxy({
+      command: process.execPath,
+      args: [fakeServerPath],
+      options: { readOnly: true, disableSpillReader: true },
+      clientIn: noReaderIn,
+      clientOut: noReaderOut,
+    });
+    const noReaderPromise = new Promise<string>((resolve) => {
+      let buf = "";
+      noReaderOut.on("data", (chunk: Buffer) => {
+        buf += chunk.toString();
+        if (buf.includes("\n")) resolve(buf.trim());
+      });
+    });
+    noReaderIn.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 99, method: "tools/list", params: {} })}\n`,
+    );
+    const noReaderLine = await noReaderPromise;
+    noReaderProxy.close();
+    const noReaderList = JSON.parse(noReaderLine) as {
+      result: { tools: McpToolDefinition[] };
+    };
+    expect(noReaderList.result.tools.map((t) => t.name)).toEqual(["get_logs"]);
+
+    // Verify standalone server honors disableSpillReader and executes mcp_diet_read_spill when enabled
+    const standaloneIn = new PassThrough();
+    const standaloneOut = new PassThrough();
+    const standaloneDisabled = startStandaloneMcpServer({
+      options: { disableSpillReader: true },
+      clientIn: standaloneIn,
+      clientOut: standaloneOut,
+    });
+    const standaloneLines: string[] = [];
+    standaloneOut.on("data", (chunk: Buffer) => {
+      for (const l of chunk.toString().split(/\r?\n/)) {
+        if (l.trim()) standaloneLines.push(l.trim());
+      }
+    });
+    standaloneIn.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })}\n`,
+    );
+    await new Promise((r) => setTimeout(r, 30));
+    standaloneDisabled.close();
+    const standaloneParsed = JSON.parse(standaloneLines[0]!) as {
+      result: { tools: McpToolDefinition[] };
+    };
+    expect(standaloneParsed.result.tools.map((t) => t.name)).toEqual([
+      "mcp_diet_analyze_tools",
+      "mcp_diet_redact_text",
+      "mcp_diet_status",
+    ]);
   });
 });

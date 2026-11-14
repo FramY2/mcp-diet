@@ -45,4 +45,4 @@ jobs:
             | docker run --rm -i mcp-diet:ci | tee /tmp/docker-mcp-out.jsonl
           grep -q '"@framy2/mcp-diet"' /tmp/docker-mcp-out.jsonl
           grep -q '"mcp_diet_analyze_tools"' /tmp/docker-mcp-out.jsonl
-          docker run --rm --entrypoint mcp-diet mcp-diet:ci --version | grep -q '0.1.1'
+          docker run --rm --entrypoint mcp-diet mcp-diet:ci --version | grep -q '0.2.0'

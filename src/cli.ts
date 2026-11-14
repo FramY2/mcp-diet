@@ -28,6 +28,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   let maxResultKb = 512;
   let redactSecrets = false;
   let spillDir: string | undefined;
+  let disableSpillReader = false;
   let help = false;
   let version = false;
   let selfTestServer = false;
@@ -59,6 +60,8 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       readOnly = true;
     } else if (arg === "--redact-secrets") {
       redactSecrets = true;
+    } else if (arg === "--no-spill-reader") {
+      disableSpillReader = true;
     } else if (arg === "--allow") {
       const val = argv[++i];
       if (!val) throw new Error("--allow requires a tool name or pattern list.");
@@ -120,6 +123,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       maxResultKb,
       redactSecrets,
       spillDir,
+      disableSpillReader,
     },
     command,
     commandArgs,
@@ -131,9 +135,9 @@ function getVersion(): string {
     const pkg = JSON.parse(
       readFileSync(new URL("../package.json", import.meta.url), "utf8"),
     ) as { version?: string };
-    return pkg.version ?? "0.1.1";
+    return pkg.version ?? "0.2.0";
   } catch {
-    return "0.1.1";
+    return "0.2.0";
   }
 }
 
@@ -154,6 +158,7 @@ function printHelp(): void {
       "  --max-result-kb <kb>    Spill oversized tools/call results to a temp file (default: 512)",
       "  --redact-secrets        Redact leaked API keys, PATs, and credentials in tools/call output",
       "  --spill-dir <dir>       Custom directory for spilled oversized tool outputs",
+      "  --no-spill-reader       Disable the virtual mcp_diet_read_spill tool in tools/list and tools/call",
       "  --self-test-server      Run standalone diagnostic MCP server over stdio (for introspection/Glama)",
       "  -v, --version           Print version",
       "  -h, --help              Print help",

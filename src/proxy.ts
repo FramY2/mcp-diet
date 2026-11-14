@@ -1,9 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
@@ -31,6 +31,46 @@ export interface McpDietOptions {
   maxResultKb?: number;
   redactSecrets?: boolean;
   spillDir?: string;
+  disableSpillReader?: boolean;
+}
+
+export interface SpillSectionEntry {
+  label: string;
+  kind: "json-key" | "json-item" | "heading" | "log-block";
+  startByte: number;
+  endByte: number;
+  startLine: number;
+  endLine: number;
+}
+
+export interface SpillStructureMap {
+  totalBytes: number;
+  totalLines: number;
+  sha256: string;
+  sections: SpillSectionEntry[];
+  headPreview: string;
+  tailPreview?: string;
+}
+
+export interface ReadSpillArgs {
+  path: string;
+  startLine?: number;
+  endLine?: number;
+  offsetBytes?: number;
+  maxBytes?: number;
+  jsonPointer?: string;
+}
+
+export interface ReadSpillToolResult {
+  isError?: boolean;
+  content: Array<{ type: "text"; text: string }>;
+  _mcpDietRead?: {
+    path: string;
+    totalBytes: number;
+    totalLines: number;
+    returnedBytes: number;
+    truncated: boolean;
+  };
 }
 
 export interface TreeShakeStats {
@@ -303,6 +343,60 @@ export function redactSecretsInValue(value: unknown): unknown {
   return value;
 }
 
+const HEAD_PREVIEW_CHARS = 1200;
+const TAIL_PREVIEW_THRESHOLD = 1600;
+const TAIL_PREVIEW_CHARS = 400;
+const DEFAULT_READ_SPILL_LIMIT_BYTES = 64 * 1024;
+const SPILL_FILENAME_REGEX = /^mcp-tool-output-\d+-[a-f0-9]{12}\.json$/;
+const LOG_HEADER_REGEX = /^(?:ERROR|WARN|FAIL|===|---|\[\d{4}-\d{2}-\d{2})/;
+const MARKDOWN_HEADING_REGEX = /^#{1,4}\s+.+/;
+
+export const MCP_DIET_READ_SPILL_TOOL: McpToolDefinition = {
+  name: "mcp_diet_read_spill",
+  description:
+    "Safely read a bounded slice from an oversized mcp-diet spill file by 1-based line range, UTF-8 byte offset, or RFC 6901 JSON Pointer.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      path: {
+        type: "string",
+        description:
+          "Absolute path to the mcp-tool-output-*.json spill file inside the configured spill directory.",
+      },
+      startLine: {
+        type: "number",
+        description: "1-based inclusive start line number to read.",
+      },
+      endLine: {
+        type: "number",
+        description: "1-based inclusive end line number to read.",
+      },
+      offsetBytes: {
+        type: "number",
+        description: "0-based UTF-8 byte offset to begin reading from.",
+      },
+      maxBytes: {
+        type: "number",
+        description:
+          "Maximum UTF-8 bytes to return (capped by the active mcp-diet limit).",
+      },
+      jsonPointer: {
+        type: "string",
+        description:
+          "RFC 6901 JSON Pointer (e.g. /results/0/title) to extract a nested value from JSON spills.",
+      },
+    },
+    required: ["path"],
+  },
+  annotations: {
+    title: "Read Spilled Tool Output",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+};
+
 function summarizeContentItemForPreview(item: Record<string, unknown>): string {
   if (typeof item.text === "string") {
     return item.text;
@@ -327,6 +421,894 @@ function summarizeContentItemForPreview(item: Record<string, unknown>): string {
     return `[${item.type} block (${mime}, ${dataLen} base64 chars)]`;
   }
   return "";
+}
+
+function extractMcpContentText(parsed: unknown): string | null {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const record = parsed as Record<string, unknown>;
+  if (!Array.isArray(record.content) || record.content.length === 0) {
+    return null;
+  }
+  const isMcpEnvelope = record.content.every(
+    (item) =>
+      item &&
+      typeof item === "object" &&
+      !Array.isArray(item) &&
+      typeof (item as Record<string, unknown>).type === "string" &&
+      ["text", "image", "audio", "resource", "resource_link"].includes(
+        (item as Record<string, unknown>).type as string,
+      ),
+  );
+  if (!isMcpEnvelope) {
+    return null;
+  }
+  const joinedText = (record.content as Array<Record<string, unknown>>)
+    .map((item) => summarizeContentItemForPreview(item))
+    .filter(Boolean)
+    .join("\n");
+  return joinedText.length > 0 ? joinedText : null;
+}
+
+interface LineSpan {
+  lineNum: number;
+  cleanText: string;
+  startByte: number;
+  endByte: number;
+}
+
+function computeLineSpans(text: string): LineSpan[] {
+  if (text.length === 0) return [];
+  const spans: LineSpan[] = [];
+  let charStart = 0;
+  let byteOffset = 0;
+  let lineNum = 1;
+
+  while (charStart <= text.length) {
+    if (charStart === text.length) {
+      break;
+    }
+    const nlIdx = text.indexOf("\n", charStart);
+    const hasNewline = nlIdx !== -1;
+    const rawEnd = hasNewline ? nlIdx + 1 : text.length;
+    const contentEnd = hasNewline ? nlIdx : text.length;
+    let rawLine = text.slice(charStart, contentEnd);
+    if (rawLine.endsWith("\r")) {
+      rawLine = rawLine.slice(0, -1);
+    }
+    const lineBytes = Buffer.byteLength(text.slice(charStart, rawEnd), "utf8");
+    spans.push({
+      lineNum,
+      cleanText: rawLine,
+      startByte: byteOffset,
+      endByte: byteOffset + lineBytes,
+    });
+    byteOffset += lineBytes;
+    lineNum += 1;
+    charStart = rawEnd;
+  }
+
+  return spans;
+}
+
+function splitLinesForSlicing(text: string): string[] {
+  if (text.length === 0) return [];
+  const rawLines = text.split("\n").map((line) =>
+    line.endsWith("\r") ? line.slice(0, -1) : line,
+  );
+  if (text.endsWith("\n")) {
+    rawLines.pop();
+  }
+  return rawLines;
+}
+
+function describeJsonValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `array[${value.length}]`;
+  }
+  if (value === null) {
+    return "null";
+  }
+  return typeof value;
+}
+
+function skipJsonString(text: string, start: number): number {
+  let i = start + 1;
+  const len = text.length;
+  while (i < len) {
+    const ch = text.charCodeAt(i);
+    if (ch === 0x5c /* \ */) {
+      i += 2;
+      continue;
+    }
+    if (ch === 0x22 /* " */) {
+      return i + 1;
+    }
+    i++;
+  }
+  return len;
+}
+
+function skipJsonWhitespace(text: string, start: number): number {
+  let i = start;
+  const len = text.length;
+  while (i < len) {
+    const ch = text.charCodeAt(i);
+    if (ch !== 0x20 && ch !== 0x09 && ch !== 0x0a && ch !== 0x0d) {
+      break;
+    }
+    i++;
+  }
+  return i;
+}
+
+function skipJsonValue(text: string, start: number): number {
+  let i = skipJsonWhitespace(text, start);
+  const len = text.length;
+  if (i >= len) return len;
+
+  const first = text.charCodeAt(i);
+  if (first === 0x22 /* " */) {
+    return skipJsonString(text, i);
+  }
+  if (first === 0x7b /* { */ || first === 0x5b /* [ */) {
+    let depth = 1;
+    i++;
+    while (i < len && depth > 0) {
+      const ch = text.charCodeAt(i);
+      if (ch === 0x22 /* " */) {
+        i = skipJsonString(text, i);
+        continue;
+      }
+      if (ch === 0x7b || ch === 0x5b) {
+        depth++;
+      } else if (ch === 0x7d || ch === 0x5d) {
+        depth--;
+      }
+      i++;
+    }
+    return i;
+  }
+
+  while (i < len) {
+    const ch = text.charCodeAt(i);
+    if (
+      ch === 0x2c ||
+      ch === 0x7d ||
+      ch === 0x5d ||
+      ch === 0x20 ||
+      ch === 0x09 ||
+      ch === 0x0a ||
+      ch === 0x0d
+    ) {
+      break;
+    }
+    i++;
+  }
+  return i;
+}
+
+interface CursorState {
+  charIdx: number;
+  byteOffset: number;
+  line: number;
+}
+
+function advanceCursor(
+  text: string,
+  state: CursorState,
+  targetCharIdx: number,
+): void {
+  if (targetCharIdx <= state.charIdx) return;
+  const slice = text.slice(state.charIdx, targetCharIdx);
+  state.byteOffset += Buffer.byteLength(slice, "utf8");
+  let pos = 0;
+  while (true) {
+    const nl = slice.indexOf("\n", pos);
+    if (nl === -1) break;
+    state.line += 1;
+    pos = nl + 1;
+  }
+  state.charIdx = targetCharIdx;
+}
+
+function parseJsonStructureSections(
+  text: string,
+  maxEntries: number,
+): SpillSectionEntry[] | null {
+  const firstNonWs = skipJsonWhitespace(text, 0);
+  if (firstNonWs >= text.length) return null;
+  const opener = text.charCodeAt(firstNonWs);
+  if (opener !== 0x7b /* { */ && opener !== 0x5b /* [ */) {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+
+  if (maxEntries <= 0) return [];
+
+  const cursor: CursorState = { charIdx: 0, byteOffset: 0, line: 1 };
+  const len = text.length;
+
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const obj = parsed as Record<string, unknown>;
+    const sections: SpillSectionEntry[] = [];
+    let i = skipJsonWhitespace(text, firstNonWs + 1);
+
+    while (i < len && text.charCodeAt(i) !== 0x7d /* } */) {
+      if (text.charCodeAt(i) !== 0x22 /* " */) {
+        break;
+      }
+      const entryStartChar = i;
+      const keyEndChar = skipJsonString(text, i);
+      const rawKey = text.slice(entryStartChar, keyEndChar);
+      let keyName = rawKey;
+      try {
+        keyName = String(JSON.parse(rawKey));
+      } catch {
+        // Keep rawKey fallback
+      }
+
+      i = skipJsonWhitespace(text, keyEndChar);
+      if (text.charCodeAt(i) === 0x3a /* : */) {
+        i++;
+      }
+      const valStartChar = skipJsonWhitespace(text, i);
+      const valEndChar = skipJsonValue(text, valStartChar);
+
+      advanceCursor(text, cursor, entryStartChar);
+      const startByte = cursor.byteOffset;
+      const startLine = cursor.line;
+
+      advanceCursor(text, cursor, valEndChar);
+      const endByte = cursor.byteOffset;
+      const endLine = cursor.line;
+
+      const valHint = Object.prototype.hasOwnProperty.call(obj, keyName)
+        ? describeJsonValue(obj[keyName])
+        : "unknown";
+      sections.push({
+        label: truncateDeterministic(`${keyName} (${valHint})`, 80),
+        kind: "json-key",
+        startByte,
+        endByte,
+        startLine,
+        endLine,
+      });
+
+      if (sections.length >= maxEntries) {
+        break;
+      }
+
+      i = skipJsonWhitespace(text, valEndChar);
+      if (text.charCodeAt(i) === 0x2c /* , */) {
+        i = skipJsonWhitespace(text, i + 1);
+      }
+    }
+
+    return sections;
+  }
+
+  if (Array.isArray(parsed)) {
+    if (parsed.length === 0) return [];
+
+    const itemSpans: Array<{
+      index: number;
+      startByte: number;
+      endByte: number;
+      startLine: number;
+      endLine: number;
+    }> = [];
+
+    let i = skipJsonWhitespace(text, firstNonWs + 1);
+    let idx = 0;
+    while (i < len && text.charCodeAt(i) !== 0x5d /* ] */) {
+      const itemStartChar = i;
+      const itemEndChar = skipJsonValue(text, itemStartChar);
+
+      advanceCursor(text, cursor, itemStartChar);
+      const startByte = cursor.byteOffset;
+      const startLine = cursor.line;
+
+      advanceCursor(text, cursor, itemEndChar);
+      const endByte = cursor.byteOffset;
+      const endLine = cursor.line;
+
+      itemSpans.push({
+        index: idx,
+        startByte,
+        endByte,
+        startLine,
+        endLine,
+      });
+      idx++;
+
+      i = skipJsonWhitespace(text, itemEndChar);
+      if (text.charCodeAt(i) === 0x2c /* , */) {
+        i = skipJsonWhitespace(text, i + 1);
+      }
+    }
+
+    if (itemSpans.length <= maxEntries) {
+      return itemSpans.map((span) => ({
+        label: `[${span.index}] (${describeJsonValue(parsed[span.index])})`,
+        kind: "json-item" as const,
+        startByte: span.startByte,
+        endByte: span.endByte,
+        startLine: span.startLine,
+        endLine: span.endLine,
+      }));
+    }
+
+    const chunkSize = Math.ceil(itemSpans.length / maxEntries);
+    const sections: SpillSectionEntry[] = [];
+    for (let startIdx = 0; startIdx < itemSpans.length; startIdx += chunkSize) {
+      const endIdx = Math.min(itemSpans.length - 1, startIdx + chunkSize - 1);
+      const firstSpan = itemSpans[startIdx]!;
+      const lastSpan = itemSpans[endIdx]!;
+      const count = endIdx - startIdx + 1;
+      sections.push({
+        label: `items[${startIdx}..${endIdx}] (${count} items)`,
+        kind: "json-item",
+        startByte: firstSpan.startByte,
+        endByte: lastSpan.endByte,
+        startLine: firstSpan.startLine,
+        endLine: lastSpan.endLine,
+      });
+      if (sections.length >= maxEntries) {
+        break;
+      }
+    }
+
+    return sections;
+  }
+
+  return [];
+}
+
+export function buildSpillStructureMap(
+  text: string,
+  maxEntries = 20,
+): SpillStructureMap {
+  const totalBytes = Buffer.byteLength(text, "utf8");
+  const sha256 = createHash("sha256").update(text, "utf8").digest("hex");
+  const headPreview = text.slice(0, HEAD_PREVIEW_CHARS);
+  const tailPreview =
+    text.length > TAIL_PREVIEW_THRESHOLD
+      ? text.slice(-TAIL_PREVIEW_CHARS)
+      : undefined;
+
+  const lineSpans = computeLineSpans(text);
+  const totalLines = lineSpans.length;
+  const boundedMax = Math.max(0, Math.floor(maxEntries));
+
+  let sections: SpillSectionEntry[] = [];
+  const jsonSections = parseJsonStructureSections(text, boundedMax);
+  if (jsonSections !== null) {
+    sections = jsonSections;
+  } else if (boundedMax > 0 && lineSpans.length > 0) {
+    const headingIndices: number[] = [];
+    const logIndices: number[] = [];
+
+    for (let i = 0; i < lineSpans.length; i++) {
+      const lineText = lineSpans[i]!.cleanText;
+      if (MARKDOWN_HEADING_REGEX.test(lineText)) {
+        headingIndices.push(i);
+      }
+      if (LOG_HEADER_REGEX.test(lineText)) {
+        logIndices.push(i);
+      }
+    }
+
+    const useHeadings =
+      headingIndices.length > 0 &&
+      (logIndices.length === 0 ||
+        headingIndices.length >= 2 ||
+        logIndices.length < 3);
+
+    const chosenIndices = useHeadings ? headingIndices : logIndices;
+    const chosenKind: SpillSectionEntry["kind"] = useHeadings
+      ? "heading"
+      : "log-block";
+
+    for (let k = 0; k < chosenIndices.length && sections.length < boundedMax; k++) {
+      const startSpanIdx = chosenIndices[k]!;
+      const nextMatchIdx = chosenIndices[k + 1];
+      const endSpanIdx =
+        nextMatchIdx !== undefined ? nextMatchIdx - 1 : lineSpans.length - 1;
+      const startSpan = lineSpans[startSpanIdx]!;
+      const endSpan = lineSpans[Math.max(startSpanIdx, endSpanIdx)]!;
+
+      sections.push({
+        label: truncateDeterministic(startSpan.cleanText, 80),
+        kind: chosenKind,
+        startByte: startSpan.startByte,
+        endByte: endSpan.endByte,
+        startLine: startSpan.lineNum,
+        endLine: endSpan.lineNum,
+      });
+    }
+  }
+
+  return {
+    totalBytes,
+    totalLines,
+    sha256,
+    sections,
+    headPreview,
+    ...(tailPreview !== undefined ? { tailPreview } : {}),
+  };
+}
+
+function escapeJsonPointerToken(token: string): string {
+  return token.replace(/~/g, "~0").replace(/\//g, "~1");
+}
+
+function resolveJsonPointer(
+  root: unknown,
+  pointer: string,
+): { found: true; value: unknown } | { found: false; reason: string } {
+  if (pointer === "") {
+    return { found: true, value: root };
+  }
+  if (!pointer.startsWith("/")) {
+    return {
+      found: false,
+      reason: "Invalid JSON Pointer: must be empty or start with '/'.",
+    };
+  }
+
+  const tokens = pointer
+    .slice(1)
+    .split("/")
+    .map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"));
+
+  let current: unknown = root;
+  for (const token of tokens) {
+    if (Array.isArray(current)) {
+      if (!/^(?:0|[1-9][0-9]*)$/.test(token)) {
+        return {
+          found: false,
+          reason: `Invalid array index "${token}" in JSON Pointer "${pointer}".`,
+        };
+      }
+      const index = Number(token);
+      if (index < 0 || index >= current.length) {
+        return {
+          found: false,
+          reason: `JSON Pointer "${pointer}" out of bounds at index ${index}.`,
+        };
+      }
+      current = current[index];
+    } else if (current !== null && typeof current === "object") {
+      const obj = current as Record<string, unknown>;
+      if (!Object.prototype.hasOwnProperty.call(obj, token)) {
+        return {
+          found: false,
+          reason: `JSON Pointer "${pointer}" key "${token}" not found.`,
+        };
+      }
+      current = obj[token];
+    } else {
+      return {
+        found: false,
+        reason: `JSON Pointer "${pointer}" cannot traverse primitive value.`,
+      };
+    }
+  }
+
+  return { found: true, value: current };
+}
+
+function sliceUtf8ByBytes(
+  text: string,
+  offsetBytes: number,
+  maxBytes: number,
+): { text: string; totalBytes: number; truncated: boolean } {
+  const buf = Buffer.from(text, "utf8");
+  const totalBytes = buf.length;
+  if (offsetBytes >= totalBytes || maxBytes <= 0) {
+    return { text: "", totalBytes, truncated: false };
+  }
+
+  let start = Math.max(0, offsetBytes);
+  if (start > 0 && start < totalBytes) {
+    while (start < totalBytes && (buf[start]! & 0xc0) === 0x80) {
+      start++;
+    }
+  }
+
+  let end = Math.min(totalBytes, start + maxBytes);
+  if (end < totalBytes) {
+    let charStart = end;
+    while (charStart > start && (buf[charStart]! & 0xc0) === 0x80) {
+      charStart--;
+    }
+    if (charStart < end) {
+      const lead = buf[charStart]!;
+      const expectedLen =
+        (lead & 0x80) === 0
+          ? 1
+          : (lead & 0xe0) === 0xc0
+            ? 2
+            : (lead & 0xf0) === 0xe0
+              ? 3
+              : 4;
+      if (charStart + expectedLen > end) {
+        end = charStart;
+      }
+    }
+  }
+
+  return {
+    text: buf.subarray(start, end).toString("utf8"),
+    totalBytes,
+    truncated: end < totalBytes,
+  };
+}
+
+function accessDeniedSpillResult(reason: string): ReadSpillToolResult {
+  return {
+    isError: true,
+    content: [{ type: "text", text: `Access denied: ${reason}` }],
+  };
+}
+
+export function executeReadSpillTool(
+  args: ReadSpillArgs | Record<string, unknown>,
+  options: McpDietOptions = {},
+): ReadSpillToolResult {
+  if (options.disableSpillReader) {
+    return accessDeniedSpillResult(
+      "mcp_diet_read_spill is disabled by --no-spill-reader.",
+    );
+  }
+
+  const rawPath =
+    args && typeof args === "object" && typeof args.path === "string"
+      ? args.path
+      : "";
+  if (!rawPath.trim()) {
+    return accessDeniedSpillResult("missing spill file path.");
+  }
+
+  const configuredSpillDir =
+    options.spillDir ?? join(tmpdir(), "mcp-diet-spills");
+  let realSpillDir: string;
+  try {
+    realSpillDir = realpathSync(configuredSpillDir);
+  } catch {
+    return accessDeniedSpillResult(
+      "spill directory does not exist or cannot be resolved.",
+    );
+  }
+
+  let realTarget: string;
+  try {
+    realTarget = realpathSync(rawPath);
+  } catch {
+    return accessDeniedSpillResult(
+      "spill file not found or outside allowed spill directory.",
+    );
+  }
+
+  if (
+    dirname(realTarget) !== realSpillDir ||
+    !SPILL_FILENAME_REGEX.test(basename(realTarget))
+  ) {
+    return accessDeniedSpillResult(
+      "path resolves outside the allowed spill directory or has an invalid spill filename.",
+    );
+  }
+
+  try {
+    if (!statSync(realTarget).isFile()) {
+      return accessDeniedSpillResult("target is not a regular file.");
+    }
+  } catch {
+    return accessDeniedSpillResult("unable to stat spill file.");
+  }
+
+  const startLine =
+    args.startLine !== undefined ? Number(args.startLine) : undefined;
+  const endLine = args.endLine !== undefined ? Number(args.endLine) : undefined;
+  const offsetBytes =
+    args.offsetBytes !== undefined ? Number(args.offsetBytes) : undefined;
+  const maxBytesArg =
+    args.maxBytes !== undefined ? Number(args.maxBytes) : undefined;
+  const jsonPointer =
+    typeof args.jsonPointer === "string" ? args.jsonPointer : undefined;
+
+  if (
+    startLine !== undefined &&
+    (!Number.isInteger(startLine) || startLine < 1)
+  ) {
+    return {
+      isError: true,
+      content: [
+        { type: "text", text: "Invalid startLine: must be an integer >= 1." },
+      ],
+    };
+  }
+  if (endLine !== undefined && (!Number.isInteger(endLine) || endLine < 1)) {
+    return {
+      isError: true,
+      content: [
+        { type: "text", text: "Invalid endLine: must be an integer >= 1." },
+      ],
+    };
+  }
+  if (
+    startLine !== undefined &&
+    endLine !== undefined &&
+    endLine < startLine
+  ) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: "Invalid line range: endLine must be >= startLine.",
+        },
+      ],
+    };
+  }
+  if (
+    offsetBytes !== undefined &&
+    (!Number.isInteger(offsetBytes) || offsetBytes < 0)
+  ) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: "Invalid offsetBytes: must be an integer >= 0.",
+        },
+      ],
+    };
+  }
+  if (
+    maxBytesArg !== undefined &&
+    (!Number.isFinite(maxBytesArg) || maxBytesArg <= 0)
+  ) {
+    return {
+      isError: true,
+      content: [
+        { type: "text", text: "Invalid maxBytes: must be a positive number." },
+      ],
+    };
+  }
+
+  const configuredMaxBytes =
+    options.maxResultKb !== undefined && options.maxResultKb > 0
+      ? Math.floor(options.maxResultKb * 1024)
+      : DEFAULT_READ_SPILL_LIMIT_BYTES;
+  const limitBytes = Math.min(
+    configuredMaxBytes,
+    DEFAULT_READ_SPILL_LIMIT_BYTES,
+  );
+  const byteCap = Math.min(
+    maxBytesArg !== undefined ? Math.floor(maxBytesArg) : limitBytes,
+    limitBytes,
+  );
+
+  let rawFileText: string;
+  try {
+    rawFileText = readFileSync(realTarget, "utf8");
+  } catch {
+    return accessDeniedSpillResult("unable to read spill file.");
+  }
+
+  let parsedJson: unknown = undefined;
+  let hasParsedJson = false;
+  let unwrappedEnvelopeText: string | null = null;
+  try {
+    parsedJson = JSON.parse(rawFileText);
+    hasParsedJson = true;
+    unwrappedEnvelopeText = extractMcpContentText(parsedJson);
+  } catch {
+    hasParsedJson = false;
+  }
+
+  const shouldRedact = options.redactSecrets !== false;
+
+  if (jsonPointer !== undefined) {
+    if (!hasParsedJson) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: "JSON Pointer error: spill file does not contain valid JSON.",
+          },
+        ],
+      };
+    }
+
+    let resolved = resolveJsonPointer(parsedJson, jsonPointer);
+    if (!resolved.found && unwrappedEnvelopeText !== null) {
+      try {
+        const innerJson = JSON.parse(unwrappedEnvelopeText);
+        const innerResolved = resolveJsonPointer(innerJson, jsonPointer);
+        if (innerResolved.found) {
+          resolved = innerResolved;
+        }
+      } catch {
+        // Inner payload is not JSON; keep original not-found error
+      }
+    }
+
+    if (!resolved.found) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: resolved.reason }],
+      };
+    }
+
+    let formatted =
+      typeof resolved.value === "string"
+        ? resolved.value
+        : JSON.stringify(resolved.value, null, 2);
+    if (shouldRedact) {
+      formatted = redactSecretsInText(formatted);
+    }
+    const sliced = sliceUtf8ByBytes(formatted, 0, byteCap);
+    return {
+      content: [{ type: "text", text: sliced.text }],
+      _mcpDietRead: {
+        path: realTarget,
+        totalBytes: Buffer.byteLength(rawFileText, "utf8"),
+        totalLines: splitLinesForSlicing(unwrappedEnvelopeText ?? rawFileText)
+          .length,
+        returnedBytes: Buffer.byteLength(sliced.text, "utf8"),
+        truncated: sliced.truncated,
+      },
+    };
+  }
+
+  const targetText = unwrappedEnvelopeText ?? rawFileText;
+  const lines = splitLinesForSlicing(targetText);
+  const targetTotalBytes = Buffer.byteLength(targetText, "utf8");
+
+  let outputText: string;
+  let truncated = false;
+
+  if (startLine !== undefined || endLine !== undefined) {
+    const startIdx = (startLine ?? 1) - 1;
+    const endIdx = Math.min(endLine ?? lines.length, lines.length);
+    const joined =
+      startIdx >= lines.length ? "" : lines.slice(startIdx, endIdx).join("\n");
+    const redacted = shouldRedact ? redactSecretsInText(joined) : joined;
+    const capped = sliceUtf8ByBytes(redacted, 0, byteCap);
+    outputText = capped.text;
+    truncated = capped.truncated || endIdx < lines.length;
+  } else {
+    const slice = sliceUtf8ByBytes(targetText, offsetBytes ?? 0, byteCap);
+    const redacted = shouldRedact
+      ? redactSecretsInText(slice.text)
+      : slice.text;
+    const reCapped = sliceUtf8ByBytes(redacted, 0, byteCap);
+    outputText = reCapped.text;
+    truncated = slice.truncated || reCapped.truncated;
+  }
+
+  return {
+    content: [{ type: "text", text: outputText }],
+    _mcpDietRead: {
+      path: realTarget,
+      totalBytes: targetTotalBytes,
+      totalLines: lines.length,
+      returnedBytes: Buffer.byteLength(outputText, "utf8"),
+      truncated,
+    },
+  };
+}
+
+function formatSpillNotificationText(params: {
+  originalBytes: number;
+  maxKb: number;
+  maxBytes: number;
+  spilledPath: string;
+  structureMap: SpillStructureMap;
+  disableSpillReader?: boolean;
+}): string {
+  const {
+    originalBytes,
+    maxKb,
+    maxBytes,
+    spilledPath,
+    structureMap,
+    disableSpillReader,
+  } = params;
+  const shaPrefix = structureMap.sha256.slice(0, 12);
+
+  const buildText = (
+    maxSectionsToShow: number,
+    headLimit: number,
+    tailLimit: number,
+  ): string => {
+    const visibleSections = structureMap.sections.slice(0, maxSectionsToShow);
+    const sectionLines =
+      visibleSections.length > 0
+        ? visibleSections.map(
+            (s) =>
+              `  [L${s.startLine}-L${s.endLine} | bytes ${s.startByte}..${s.endByte}] ${truncateDeterministic(s.label, 64)}`,
+          )
+        : [
+            `  [L1-L${Math.max(1, structureMap.totalLines)} | bytes 0..${structureMap.totalBytes}] (unstructured payload)`,
+          ];
+
+    const headSlice = structureMap.headPreview.slice(0, headLimit);
+    const tailSlice =
+      structureMap.tailPreview !== undefined && tailLimit > 0
+        ? structureMap.tailPreview.slice(-tailLimit)
+        : undefined;
+
+    const lines: string[] = [
+      `[mcp-diet] Oversized tool output intercepted (${(originalBytes / 1024).toFixed(1)} KiB > ${maxKb} KiB limit).`,
+      `Full output saved to local file: ${spilledPath}`,
+      `totalBytes=${structureMap.totalBytes} | totalLines=${structureMap.totalLines} | sha256=${shaPrefix}`,
+      `Structural Section & Offset Index:`,
+      ...sectionLines,
+      `Head Preview (first ${headSlice.length} chars):`,
+      headSlice,
+    ];
+
+    if (tailSlice !== undefined) {
+      lines.push(`Tail Preview (last ${tailSlice.length} chars):`);
+      lines.push(tailSlice);
+    }
+
+    if (!disableSpillReader) {
+      const s0 = structureMap.sections[0];
+      lines.push(`Concrete mcp_diet_read_spill examples:`);
+      if (s0?.kind === "json-key") {
+        const keyOnly = s0.label.replace(/\s+\([^)]+\)$/, "");
+        lines.push(
+          `  mcp_diet_read_spill({ path: ${JSON.stringify(spilledPath)}, jsonPointer: ${JSON.stringify(`/${escapeJsonPointerToken(keyOnly)}`)} })`,
+        );
+        lines.push(
+          `  mcp_diet_read_spill({ path: ${JSON.stringify(spilledPath)}, offsetBytes: ${s0.startByte}, maxBytes: ${Math.min(16384, Math.max(1024, s0.endByte - s0.startByte))} })`,
+        );
+      } else if (s0) {
+        lines.push(
+          `  mcp_diet_read_spill({ path: ${JSON.stringify(spilledPath)}, startLine: ${s0.startLine}, endLine: ${Math.min(s0.endLine, s0.startLine + 100)} })`,
+        );
+        lines.push(
+          `  mcp_diet_read_spill({ path: ${JSON.stringify(spilledPath)}, offsetBytes: ${s0.startByte}, maxBytes: 16384 })`,
+        );
+      } else {
+        lines.push(
+          `  mcp_diet_read_spill({ path: ${JSON.stringify(spilledPath)}, startLine: 1, endLine: ${Math.min(100, Math.max(1, structureMap.totalLines))} })`,
+        );
+        lines.push(
+          `  mcp_diet_read_spill({ path: ${JSON.stringify(spilledPath)}, offsetBytes: 0, maxBytes: 16384 })`,
+        );
+      }
+    }
+
+    return lines.join("\n");
+  };
+
+  let formatted = buildText(
+    structureMap.sections.length,
+    HEAD_PREVIEW_CHARS,
+    TAIL_PREVIEW_CHARS,
+  );
+  // Keep spill summary strictly under tiny test thresholds (e.g. maxResultKb: 4)
+  if (maxBytes <= 8192 && formatted.length >= maxBytes) {
+    formatted = buildText(Math.min(10, structureMap.sections.length), 600, 200);
+    if (formatted.length >= maxBytes) {
+      formatted = buildText(Math.min(5, structureMap.sections.length), 300, 100);
+    }
+  }
+  return formatted;
 }
 
 export async function guardToolCallResult(
@@ -389,8 +1371,15 @@ export async function guardToolCallResult(
     }
   }
 
-  const previewChars = Math.min(2048, Math.max(256, Math.floor(maxBytes / 4)));
-  const preview = previewText.slice(0, previewChars);
+  const structureMap = buildSpillStructureMap(previewText);
+  const formattedText = formatSpillNotificationText({
+    originalBytes,
+    maxKb,
+    maxBytes,
+    spilledPath,
+    structureMap,
+    disableSpillReader: options.disableSpillReader,
+  });
 
   return {
     spilledPath,
@@ -400,18 +1389,17 @@ export async function guardToolCallResult(
       content: [
         {
           type: "text",
-          text: [
-            `[mcp-diet] Oversized tool output intercepted (${(originalBytes / 1024).toFixed(1)} KiB > ${maxKb} KiB limit).`,
-            `Full output saved to local file: ${spilledPath}`,
-            `Preview (first ${preview.length} chars):`,
-            preview,
-          ].join("\n"),
+          text: formattedText,
         },
       ],
       _mcpDietSpilled: {
         path: spilledPath,
         originalBytes,
         maxBytes,
+        totalBytes: structureMap.totalBytes,
+        totalLines: structureMap.totalLines,
+        sha256: structureMap.sha256,
+        sections: structureMap.sections,
       },
     },
   };
@@ -459,11 +1447,35 @@ export async function transformJsonRpcMessage(
       }
     }
     const filtered = filterToolsList(rawTools, options);
+    let nextTools = filtered.tools;
+
+    const denyList = normalizePatternList(options.deny);
+    const spillReaderDenied =
+      denyList.length > 0 &&
+      denyList.some((p) => matchesPattern(MCP_DIET_READ_SPILL_TOOL.name, p));
+
+    if (!options.disableSpillReader && !spillReaderDenied) {
+      const compactedVirtual = filterToolsList([MCP_DIET_READ_SPILL_TOOL], {
+        maxDescChars: options.maxDescChars,
+      }).tools;
+      const withoutDuplicate = nextTools.filter(
+        (t) => t.name !== MCP_DIET_READ_SPILL_TOOL.name,
+      );
+      nextTools = [...withoutDuplicate, ...compactedVirtual].sort((a, b) =>
+        a.name.localeCompare(b.name),
+      );
+      if (knownTools) {
+        for (const vt of compactedVirtual) {
+          knownTools.set(vt.name, vt);
+        }
+      }
+    }
+
     return JSON.stringify({
       ...parsed,
       result: {
         ...resultObj,
-        tools: filtered.tools,
+        tools: nextTools,
       },
     });
   }
@@ -564,6 +1576,9 @@ export function startStdioMcpProxy(params: {
 
   const pendingRequests = new Map<string | number, string>();
   const knownTools = new Map<string, McpToolDefinition>();
+  if (!params.options.disableSpillReader) {
+    knownTools.set(MCP_DIET_READ_SPILL_TOOL.name, MCP_DIET_READ_SPILL_TOOL);
+  }
 
   const clientReader = createInterface({ input: clientIn });
   clientReader.on("line", (line) => {
@@ -587,6 +1602,51 @@ export function startStdioMcpProxy(params: {
             msgParams && typeof msgParams.name === "string"
               ? msgParams.name
               : null;
+
+          if (
+            toolName === MCP_DIET_READ_SPILL_TOOL.name &&
+            !params.options.disableSpillReader
+          ) {
+            const denyList = normalizePatternList(params.options.deny);
+            const spillReaderDenied =
+              denyList.length > 0 &&
+              denyList.some((p) => matchesPattern(toolName, p));
+            if (spillReaderDenied) {
+              clientOut.write(
+                `${JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: msgId,
+                  result: {
+                    isError: true,
+                    content: [
+                      {
+                        type: "text",
+                        text: `[mcp-diet] Tool call "${toolName}" blocked by runtime firewall policy.`,
+                      },
+                    ],
+                  },
+                })}\n`,
+              );
+              return;
+            }
+
+            const toolArgs =
+              msgParams &&
+              msgParams.arguments &&
+              typeof msgParams.arguments === "object"
+                ? (msgParams.arguments as Record<string, unknown>)
+                : {};
+            const readResult = executeReadSpillTool(toolArgs, params.options);
+            clientOut.write(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                id: msgId,
+                result: readResult,
+              })}\n`,
+            );
+            return;
+          }
+
           if (
             toolName &&
             !isToolCallAllowed(toolName, params.options, knownTools)
@@ -788,6 +1848,7 @@ export const STANDALONE_MCP_TOOLS: McpToolDefinition[] = [
       openWorldHint: false,
     },
   },
+  MCP_DIET_READ_SPILL_TOOL,
 ];
 
 export interface StandaloneServerHandle {
@@ -801,12 +1862,18 @@ export function startStandaloneMcpServer(params?: {
   clientOut?: Writable;
 }): StandaloneServerHandle {
   const options = params?.options ?? {};
-  const version = params?.version ?? "0.1.1";
+  const version = params?.version ?? "0.2.0";
   const clientIn = params?.clientIn ?? process.stdin;
   const clientOut = params?.clientOut ?? process.stdout;
 
+  const activeStandaloneTools = options.disableSpillReader
+    ? STANDALONE_MCP_TOOLS.filter(
+        (t) => t.name !== MCP_DIET_READ_SPILL_TOOL.name,
+      )
+    : STANDALONE_MCP_TOOLS;
+
   const knownTools = new Map<string, McpToolDefinition>(
-    STANDALONE_MCP_TOOLS.map((t) => [t.name, t]),
+    activeStandaloneTools.map((t) => [t.name, t]),
   );
 
   let queue = Promise.resolve();
@@ -878,7 +1945,7 @@ export function startStandaloneMcpServer(params?: {
         }
 
         if (method === "tools/list") {
-          const filtered = filterToolsList(STANDALONE_MCP_TOOLS, options);
+          const filtered = filterToolsList(activeStandaloneTools, options);
           clientOut.write(
             `${JSON.stringify({
               jsonrpc: "2.0",
@@ -962,6 +2029,18 @@ export function startStandaloneMcpServer(params?: {
                     },
                   ],
                 },
+              })}\n`,
+            );
+            return;
+          }
+
+          if (toolName === MCP_DIET_READ_SPILL_TOOL.name) {
+            const readResult = executeReadSpillTool(toolArgs, options);
+            clientOut.write(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                id,
+                result: readResult,
               })}\n`,
             );
             return;

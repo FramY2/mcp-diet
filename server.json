@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.FramY2/mcp-diet",
+  "title": "mcp-diet",
+  "description": "Zero-dependency stdio MCP proxy and runtime context firewall with deterministic tools/list tree-shaking, structured >=512 KiB spill offset maps, sandboxed spill paging (mcp_diet_read_spill), and live secret redaction.",
+  "version": "0.2.0",
+  "repository": {
+    "url": "https://github.com/FramY2/mcp-diet",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/FramY2/mcp-diet#readme",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@framy2/mcp-diet",
+      "version": "0.2.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
