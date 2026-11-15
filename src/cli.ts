@@ -15,6 +15,7 @@ export interface ParsedCliArgs {
   help: boolean;
   version: boolean;
   selfTestServer: boolean;
+  reportStats: boolean;
   options: McpDietOptions;
   command: string | null;
   commandArgs: string[];
@@ -26,9 +27,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   let readOnly = false;
   let maxDescChars: number | undefined;
   let maxResultKb = 512;
+  let maxImageDimension: number | undefined;
   let redactSecrets = false;
   let spillDir: string | undefined;
   let disableSpillReader = false;
+  let reportStats = false;
   let help = false;
   let version = false;
   let selfTestServer = false;
@@ -62,6 +65,8 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       redactSecrets = true;
     } else if (arg === "--no-spill-reader") {
       disableSpillReader = true;
+    } else if (arg === "--report-stats") {
+      reportStats = true;
     } else if (arg === "--allow") {
       const val = argv[++i];
       if (!val) throw new Error("--allow requires a tool name or pattern list.");
@@ -98,6 +103,30 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
         throw new Error("--max-result-kb must be a positive number.");
       }
       maxResultKb = val;
+    } else if (arg === "--max-image-dim") {
+      const raw = argv[++i];
+      if (raw === undefined || raw === "") {
+        throw new Error("--max-image-dim requires a non-negative integer.");
+      }
+      const val = Number(raw);
+      if (!Number.isInteger(val) || val < 0) {
+        throw new Error(
+          "--max-image-dim must be a non-negative integer (0 disables).",
+        );
+      }
+      maxImageDimension = val;
+    } else if (arg.startsWith("--max-image-dim=")) {
+      const raw = arg.slice("--max-image-dim=".length);
+      if (raw === "") {
+        throw new Error("--max-image-dim requires a non-negative integer.");
+      }
+      const val = Number(raw);
+      if (!Number.isInteger(val) || val < 0) {
+        throw new Error(
+          "--max-image-dim must be a non-negative integer (0 disables).",
+        );
+      }
+      maxImageDimension = val;
     } else if (arg === "--spill-dir") {
       const val = argv[++i];
       if (!val) throw new Error("--spill-dir requires a directory path.");
@@ -115,12 +144,14 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
     help,
     version,
     selfTestServer,
+    reportStats,
     options: {
       allow,
       deny,
       readOnly,
       maxDescChars,
       maxResultKb,
+      ...(maxImageDimension !== undefined ? { maxImageDimension } : {}),
       redactSecrets,
       spillDir,
       disableSpillReader,
@@ -135,9 +166,9 @@ function getVersion(): string {
     const pkg = JSON.parse(
       readFileSync(new URL("../package.json", import.meta.url), "utf8"),
     ) as { version?: string };
-    return pkg.version ?? "0.2.0";
+    return pkg.version ?? "0.3.0";
   } catch {
-    return "0.2.0";
+    return "0.3.0";
   }
 }
 
@@ -156,9 +187,11 @@ function printHelp(): void {
       "  --read-only             Keep only read-only tools (annotations.readOnlyHint or read-only heuristic)",
       "  --max-desc <chars>      Deterministically truncate tool and property descriptions",
       "  --max-result-kb <kb>    Spill oversized tools/call results to a temp file (default: 512)",
+      "  --max-image-dim <px>    Spill PNG/JPEG/GIF/WebP images wider/taller than <px> (default: 2000, 0 disables)",
       "  --redact-secrets        Redact leaked API keys, PATs, and credentials in tools/call output",
       "  --spill-dir <dir>       Custom directory for spilled oversized tool outputs",
       "  --no-spill-reader       Disable the virtual mcp_diet_read_spill tool in tools/list and tools/call",
+      "  --report-stats          Emit session spill & follow-up telemetry JSON to stderr on exit",
       "  --self-test-server      Run standalone diagnostic MCP server over stdio (for introspection/Glama)",
       "  -v, --version           Print version",
       "  -h, --help              Print help",
@@ -201,6 +234,11 @@ async function main(): Promise<void> {
   });
 
   proxy.child.on("exit", (code) => {
+    if (parsed.reportStats) {
+      process.stderr.write(
+        `[mcp-diet] telemetry ${JSON.stringify(proxy.getTelemetry())}\n`,
+      );
+    }
     process.exitCode = code ?? 0;
   });
   proxy.child.on("error", (err) => {

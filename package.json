@@ -1,8 +1,8 @@
 {
   "name": "@framy2/mcp-diet",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "mcpName": "io.github.FramY2/mcp-diet",
-  "description": "Zero-dependency stdio MCP proxy and runtime context firewall: deterministic tools/list tree-shaking, oversized tools/call crash guard, and live secret redaction for Claude Code, OpenAI Codex, and Cursor.",
+  "description": "Zero-dependency stdio MCP proxy and runtime context firewall: deterministic tools/list tree-shaking, oversized tools/call & >2000px image dimension crash guard, and live secret redaction for Claude Code, OpenAI Codex, and Cursor.",
   "type": "module",
   "bin": {
     "mcp-diet": "dist/cli.js"

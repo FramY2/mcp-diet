@@ -13,6 +13,7 @@ import {
   executeReadSpillTool,
   filterToolsList,
   guardToolCallResult,
+  inspectImageDimensions,
   isReadOnlyTool,
   redactSecretsInText,
   startStandaloneMcpServer,
@@ -718,7 +719,7 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
       });
     });
 
-    expect(out).toBe("0.2.0");
+    expect(out).toBe("0.3.0");
   });
 });
 
@@ -1220,5 +1221,357 @@ describe("mcp-diet v0.2.0 — structured spill offset maps and sandboxed mcp_die
       "mcp_diet_redact_text",
       "mcp_diet_status",
     ]);
+  });
+});
+
+function buildPngHeaderBase64(width: number, height: number): string {
+  const buf = Buffer.alloc(24);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(buf, 0);
+  buf.writeUInt32BE(13, 8);
+  buf.write("IHDR", 12, "ascii");
+  buf.writeUInt32BE(width, 16);
+  buf.writeUInt32BE(height, 20);
+  return buf.toString("base64");
+}
+
+function buildGif89aBase64(width: number, height: number): string {
+  const buf = Buffer.alloc(10);
+  buf.write("GIF89a", 0, "ascii");
+  buf.writeUInt16LE(width, 6);
+  buf.writeUInt16LE(height, 8);
+  return buf.toString("base64");
+}
+
+function buildJpegWithApp0Base64(width: number, height: number): string {
+  // SOI (2) + APP0 marker+len+payload (8) + SOF0 marker+len+precision+H+W+comp (11)
+  const buf = Buffer.alloc(21);
+  buf[0] = 0xff;
+  buf[1] = 0xd8;
+  buf[2] = 0xff;
+  buf[3] = 0xe0;
+  buf.writeUInt16BE(6, 4);
+  buf[10] = 0xff;
+  buf[11] = 0xc0;
+  buf.writeUInt16BE(9, 12);
+  buf[14] = 8;
+  buf.writeUInt16BE(height, 15);
+  buf.writeUInt16BE(width, 17);
+  buf[19] = 3;
+  return buf.toString("base64");
+}
+
+function buildWebpVp8xBase64(width: number, height: number): string {
+  const buf = Buffer.alloc(30);
+  buf.write("RIFF", 0, "ascii");
+  buf.writeUInt32LE(22, 4);
+  buf.write("WEBP", 8, "ascii");
+  buf.write("VP8X", 12, "ascii");
+  buf.writeUInt32LE(10, 16);
+  const wMinus1 = width - 1;
+  const hMinus1 = height - 1;
+  buf[24] = wMinus1 & 0xff;
+  buf[25] = (wMinus1 >> 8) & 0xff;
+  buf[26] = (wMinus1 >> 16) & 0xff;
+  buf[27] = hMinus1 & 0xff;
+  buf[28] = (hMinus1 >> 8) & 0xff;
+  buf[29] = (hMinus1 >> 16) & 0xff;
+  return buf.toString("base64");
+}
+
+function buildWebpVp8Base64(width: number, height: number): string {
+  const buf = Buffer.alloc(30);
+  buf.write("RIFF", 0, "ascii");
+  buf.writeUInt32LE(22, 4);
+  buf.write("WEBP", 8, "ascii");
+  buf.write("VP8 ", 12, "ascii");
+  buf.writeUInt32LE(10, 16);
+  buf[23] = 0x9d;
+  buf[24] = 0x01;
+  buf[25] = 0x2a;
+  buf.writeUInt16LE(width & 0x3fff, 26);
+  buf.writeUInt16LE(height & 0x3fff, 28);
+  return buf.toString("base64");
+}
+
+function buildWebpVp8lBase64(width: number, height: number): string {
+  const buf = Buffer.alloc(25);
+  buf.write("RIFF", 0, "ascii");
+  buf.writeUInt32LE(17, 4);
+  buf.write("WEBP", 8, "ascii");
+  buf.write("VP8L", 12, "ascii");
+  buf.writeUInt32LE(5, 16);
+  buf[20] = 0x2f;
+  const bits = ((width - 1) & 0x3fff) | (((height - 1) & 0x3fff) << 14);
+  buf.writeUInt32LE(bits >>> 0, 21);
+  return buf.toString("base64");
+}
+
+describe("mcp-diet v0.3.0 — image dimension firewall, binary image spills, and telemetry", () => {
+  it("inspects binary headers zero-dependency across PNG, JPEG (after APP0), GIF, and WebP (VP8X/VP8/VP8L)", () => {
+    const pngDims = inspectImageDimensions(buildPngHeaderBase64(2560, 3200));
+    expect(pngDims).toEqual({
+      format: "png",
+      width: 2560,
+      height: 3200,
+      byteLength: 24,
+    });
+
+    const dataUrlPng = inspectImageDimensions(
+      `data:image/png;base64,${buildPngHeaderBase64(1920, 1080)}`,
+    );
+    expect(dataUrlPng).toEqual({
+      format: "png",
+      width: 1920,
+      height: 1080,
+      byteLength: 24,
+    });
+
+    expect(inspectImageDimensions(buildJpegWithApp0Base64(3024, 4032))).toEqual({
+      format: "jpeg",
+      width: 3024,
+      height: 4032,
+      byteLength: 21,
+    });
+
+    expect(inspectImageDimensions(buildGif89aBase64(2400, 900))).toEqual({
+      format: "gif",
+      width: 2400,
+      height: 900,
+      byteLength: 10,
+    });
+
+    expect(inspectImageDimensions(buildWebpVp8xBase64(2800, 2100))).toEqual({
+      format: "webp",
+      width: 2800,
+      height: 2100,
+      byteLength: 30,
+    });
+
+    expect(inspectImageDimensions(buildWebpVp8Base64(1440, 2200))).toEqual({
+      format: "webp",
+      width: 1440,
+      height: 2200,
+      byteLength: 30,
+    });
+
+    expect(inspectImageDimensions(buildWebpVp8lBase64(1280, 720))).toEqual({
+      format: "webp",
+      width: 1280,
+      height: 720,
+      byteLength: 25,
+    });
+
+    expect(inspectImageDimensions("A".repeat(12_000))).toBeNull();
+    expect(inspectImageDimensions("")).toBeNull();
+  });
+
+  it("spills <10 KiB >2000px PNGs to native binary files while keeping <=2000px PNGs inline, and supports maxImageDimension=0 bypass", async () => {
+    const spillDir = await mkdtemp(join(tmpdir(), "mcp-diet-imgdim-"));
+    tempDirs.push(spillDir);
+
+    const smallInlinePng = buildPngHeaderBase64(1200, 800);
+    const oversizedPng = buildPngHeaderBase64(2560, 3200);
+
+    const guarded = await guardToolCallResult(
+      {
+        content: [
+          { type: "text", text: "Screenshot captured:" },
+          { type: "image", mimeType: "image/png", data: oversizedPng },
+          { type: "image", mimeType: "image/png", data: smallInlinePng },
+        ],
+      },
+      { maxResultKb: 512, spillDir },
+    );
+
+    expect(guarded.spilledPath).toBeNull();
+    expect(guarded.spilledImages).toHaveLength(1);
+    const imgMeta = guarded.spilledImages[0]!;
+    expect(imgMeta.index).toBe(1);
+    expect(imgMeta.width).toBe(2560);
+    expect(imgMeta.height).toBe(3200);
+    expect(imgMeta.maxDimensionPx).toBe(2000);
+    expect(imgMeta.path.endsWith(".png")).toBe(true);
+
+    const spilledBytes = await readFile(imgMeta.path);
+    expect(spilledBytes.equals(Buffer.from(oversizedPng, "base64"))).toBe(true);
+
+    const resObj = guarded.result as {
+      content: Array<{ type: string; text?: string; data?: string }>;
+      _mcpDietSpilledImages?: unknown[];
+    };
+    expect(resObj._mcpDietSpilledImages).toHaveLength(1);
+    expect(resObj.content[0]).toEqual({
+      type: "text",
+      text: "Screenshot captured:",
+    });
+    expect(resObj.content[1]?.type).toBe("text");
+    expect(resObj.content[1]?.text).toContain("2560x3200px > 2000px");
+    expect(resObj.content[1]?.text).toContain(imgMeta.path);
+    expect(resObj.content[2]).toEqual({
+      type: "image",
+      mimeType: "image/png",
+      data: smallInlinePng,
+    });
+
+    // maxImageDimension: 0 disables pixel dimension guard
+    const bypassed = await guardToolCallResult(
+      {
+        content: [{ type: "image", mimeType: "image/png", data: oversizedPng }],
+      },
+      { maxResultKb: 512, maxImageDimension: 0, spillDir },
+    );
+    expect(bypassed.spilledImages).toHaveLength(0);
+    expect(
+      (
+        bypassed.result as {
+          content: Array<{ type: string; data?: string }>;
+        }
+      ).content[0]?.type,
+    ).toBe("image");
+  });
+
+  it("parses --max-image-dim and --report-stats flags and validates invalid values", () => {
+    const parsed = parseCliArgs([
+      "--max-image-dim",
+      "1568",
+      "--report-stats",
+      "--",
+      "node",
+      "server.js",
+    ]);
+    expect(parsed.options.maxImageDimension).toBe(1568);
+    expect(parsed.reportStats).toBe(true);
+
+    const disabled = parseCliArgs([
+      "--max-image-dim=0",
+      "--",
+      "node",
+      "server.js",
+    ]);
+    expect(disabled.options.maxImageDimension).toBe(0);
+    expect(disabled.reportStats).toBe(false);
+
+    expect(() => parseCliArgs(["--max-image-dim", "-5"])).toThrow(
+      /--max-image-dim/,
+    );
+    expect(() => parseCliArgs(["--max-image-dim=abc"])).toThrow(
+      /--max-image-dim/,
+    );
+  });
+
+  it("tracks byte spills, image dimension spills, and mcp_diet_read_spill follow-up rate in session telemetry", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "mcp-diet-telemetry-"));
+    tempDirs.push(dir);
+    const spillDir = join(dir, "spills");
+    const fakeServerPath = join(dir, "telemetry-server.mjs");
+    const oversizedPng = buildPngHeaderBase64(2560, 1440);
+
+    await writeFile(
+      fakeServerPath,
+      [
+        'import { createInterface } from "node:readline";',
+        `const oversizedPng = ${JSON.stringify(oversizedPng)};`,
+        'const rl = createInterface({ input: process.stdin });',
+        'rl.on("line", (line) => {',
+        "  const msg = JSON.parse(line);",
+        '  if (msg.method === "tools/list") {',
+        "    process.stdout.write(JSON.stringify({",
+        '      jsonrpc: "2.0",',
+        "      id: msg.id,",
+        '      result: { tools: [{ name: "fetch_data", annotations: { readOnlyHint: true } }] }',
+        '    }) + "\\n");',
+        "  }",
+        '  if (msg.method === "tools/call") {',
+        "    const kind = msg.params?.arguments?.kind;",
+        '    if (kind === "big1" || kind === "big2") {',
+        "      const text = `# ${kind}\\n` + kind.repeat(2000);",
+        "      process.stdout.write(JSON.stringify({",
+        '        jsonrpc: "2.0",',
+        "        id: msg.id,",
+        '        result: { content: [{ type: "text", text }] }',
+        '      }) + "\\n");',
+        '    } else if (kind === "bigimg") {',
+        "      process.stdout.write(JSON.stringify({",
+        '        jsonrpc: "2.0",',
+        "        id: msg.id,",
+        '        result: { content: [{ type: "image", mimeType: "image/png", data: oversizedPng }] }',
+        '      }) + "\\n");',
+        "    }",
+        "  }",
+        "});",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const clientIn = new PassThrough();
+    const clientOut = new PassThrough();
+    const proxy = startStdioMcpProxy({
+      command: process.execPath,
+      args: [fakeServerPath],
+      options: { maxResultKb: 2, spillDir },
+      clientIn,
+      clientOut,
+    });
+
+    const lines: string[] = [];
+    const waiters: Array<{ count: number; resolve: () => void }> = [];
+    clientOut.on("data", (chunk: Buffer) => {
+      for (const l of chunk.toString().split(/\r?\n/)) {
+        if (l.trim()) lines.push(l.trim());
+      }
+      for (let i = waiters.length - 1; i >= 0; i--) {
+        if (lines.length >= waiters[i]!.count) {
+          waiters[i]!.resolve();
+          waiters.splice(i, 1);
+        }
+      }
+    });
+    const waitForLines = (count: number) =>
+      new Promise<void>((resolve) => {
+        if (lines.length >= count) {
+          resolve();
+          return;
+        }
+        waiters.push({ count, resolve });
+      });
+
+    clientIn.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "fetch_data", arguments: { kind: "big1" } } })}\n`,
+    );
+    await waitForLines(1);
+    const spill1Path = (
+      JSON.parse(lines[0]!) as { result: { _mcpDietSpilled: { path: string } } }
+    ).result._mcpDietSpilled.path;
+
+    // Agent follows up on spill 1
+    clientIn.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "mcp_diet_read_spill", arguments: { path: spill1Path, startLine: 1, endLine: 2 } } })}\n`,
+    );
+    await waitForLines(2);
+
+    // Second large payload is answered from preview only (never read with mcp_diet_read_spill)
+    clientIn.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "fetch_data", arguments: { kind: "big2" } } })}\n`,
+    );
+    await waitForLines(3);
+
+    // Small-byte >2000px image call
+    clientIn.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "fetch_data", arguments: { kind: "bigimg" } } })}\n`,
+    );
+    await waitForLines(4);
+
+    const telemetry = proxy.getTelemetry();
+    proxy.close();
+
+    expect(telemetry).toEqual({
+      toolCallsInspected: 3,
+      byteSpillsTriggered: 2,
+      imageDimensionSpillsTriggered: 1,
+      spillReadsCount: 1,
+      uniqueSpillsReadCount: 1,
+      previewOnlySpillsCount: 1,
+      spillReadFollowUpRate: 0.5,
+    });
   });
 });

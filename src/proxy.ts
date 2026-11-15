@@ -23,12 +23,114 @@ export interface McpToolDefinition {
   [key: string]: unknown;
 }
 
+export const DEFAULT_MAX_IMAGE_DIMENSION_PX = 2000;
+
+export interface ImageDimensions {
+  format: "png" | "jpeg" | "gif" | "webp";
+  width: number;
+  height: number;
+  byteLength: number;
+}
+
+export interface SpilledImageMetadata {
+  index: number;
+  path: string;
+  mimeType: string;
+  format: ImageDimensions["format"];
+  width: number;
+  height: number;
+  byteLength: number;
+  maxDimensionPx: number;
+  sha256: string;
+}
+
+export interface SpillTelemetryStats {
+  toolCallsInspected: number;
+  byteSpillsTriggered: number;
+  imageDimensionSpillsTriggered: number;
+  spillReadsCount: number;
+  uniqueSpillsReadCount: number;
+  previewOnlySpillsCount: number;
+  spillReadFollowUpRate: number;
+}
+
+export interface SpillTelemetryTracker {
+  recordToolCall: (params: {
+    spilledPath: string | null;
+    imageSpillCount: number;
+  }) => void;
+  recordSpillRead: (path?: string) => void;
+  getStats: () => SpillTelemetryStats;
+}
+
+function normalizeTrackablePath(filePath: string): string {
+  try {
+    return realpathSync(filePath);
+  } catch {
+    return filePath;
+  }
+}
+
+export function createSpillTelemetryTracker(): SpillTelemetryTracker {
+  let toolCallsInspected = 0;
+  let byteSpillsTriggered = 0;
+  let imageDimensionSpillsTriggered = 0;
+  let spillReadsCount = 0;
+  const spilledPaths = new Set<string>();
+  const readPaths = new Set<string>();
+
+  return {
+    recordToolCall({ spilledPath, imageSpillCount }) {
+      toolCallsInspected += 1;
+      if (spilledPath) {
+        byteSpillsTriggered += 1;
+        spilledPaths.add(normalizeTrackablePath(spilledPath));
+      }
+      if (imageSpillCount > 0) {
+        imageDimensionSpillsTriggered += imageSpillCount;
+      }
+    },
+    recordSpillRead(filePath?: string) {
+      spillReadsCount += 1;
+      if (filePath) {
+        readPaths.add(normalizeTrackablePath(filePath));
+      }
+    },
+    getStats(): SpillTelemetryStats {
+      let uniqueSpillsReadCount = 0;
+      for (const path of spilledPaths) {
+        if (readPaths.has(path)) {
+          uniqueSpillsReadCount += 1;
+        }
+      }
+      const previewOnlySpillsCount = Math.max(
+        0,
+        byteSpillsTriggered - uniqueSpillsReadCount,
+      );
+      const spillReadFollowUpRate =
+        byteSpillsTriggered > 0
+          ? Number((uniqueSpillsReadCount / byteSpillsTriggered).toFixed(4))
+          : 0;
+      return {
+        toolCallsInspected,
+        byteSpillsTriggered,
+        imageDimensionSpillsTriggered,
+        spillReadsCount,
+        uniqueSpillsReadCount,
+        previewOnlySpillsCount,
+        spillReadFollowUpRate,
+      };
+    },
+  };
+}
+
 export interface McpDietOptions {
   allow?: string[];
   deny?: string[];
   readOnly?: boolean;
   maxDescChars?: number;
   maxResultKb?: number;
+  maxImageDimension?: number;
   redactSecrets?: boolean;
   spillDir?: string;
   disableSpillReader?: boolean;
@@ -397,6 +499,168 @@ export const MCP_DIET_READ_SPILL_TOOL: McpToolDefinition = {
   },
 };
 
+const DATA_URL_BASE64_PREFIX = /^data:[^;,]+;base64,/i;
+
+function decodeBase64Payload(base64Data: string): Buffer {
+  const withoutDataUrl = base64Data.replace(DATA_URL_BASE64_PREFIX, "");
+  const cleaned = withoutDataUrl.replace(/\s+/g, "");
+  if (!cleaned) {
+    return Buffer.alloc(0);
+  }
+  return Buffer.from(cleaned, "base64");
+}
+
+function parseJpegDimensions(buf: Buffer): { width: number; height: number } | null {
+  if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) {
+    return null;
+  }
+
+  let offset = 2;
+  while (offset < buf.length) {
+    if (buf[offset] !== 0xff) {
+      break;
+    }
+    while (offset < buf.length && buf[offset] === 0xff) {
+      offset += 1;
+    }
+    if (offset >= buf.length) {
+      break;
+    }
+    const marker = buf[offset]!;
+    offset += 1;
+
+    if (marker === 0x00 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) {
+      continue;
+    }
+    if (marker === 0xd9 || marker === 0xda) {
+      break;
+    }
+    if (offset + 2 > buf.length) {
+      break;
+    }
+
+    const segLen = buf.readUInt16BE(offset);
+    if (segLen < 2 || offset + segLen > buf.length) {
+      break;
+    }
+
+    const isSofMarker =
+      (marker >= 0xc0 && marker <= 0xc3) ||
+      (marker >= 0xc5 && marker <= 0xc7) ||
+      (marker >= 0xc9 && marker <= 0xcb) ||
+      (marker >= 0xcd && marker <= 0xcf);
+    if (isSofMarker) {
+      if (segLen < 7 || offset + 7 > buf.length) {
+        return null;
+      }
+      const height = buf.readUInt16BE(offset + 3);
+      const width = buf.readUInt16BE(offset + 5);
+      return width > 0 && height > 0 ? { width, height } : null;
+    }
+
+    offset += segLen;
+  }
+
+  return null;
+}
+
+function parseWebpDimensions(buf: Buffer): { width: number; height: number } | null {
+  if (
+    buf.length < 25 ||
+    buf.toString("ascii", 0, 4) !== "RIFF" ||
+    buf.toString("ascii", 8, 12) !== "WEBP"
+  ) {
+    return null;
+  }
+
+  const chunk = buf.toString("ascii", 12, 16);
+  if (chunk === "VP8X" && buf.length >= 30) {
+    const width = 1 + (buf[24]! | (buf[25]! << 8) | (buf[26]! << 16));
+    const height = 1 + (buf[27]! | (buf[28]! << 8) | (buf[29]! << 16));
+    return width > 0 && height > 0 ? { width, height } : null;
+  }
+  if (
+    chunk === "VP8 " &&
+    buf.length >= 30 &&
+    buf[23] === 0x9d &&
+    buf[24] === 0x01 &&
+    buf[25] === 0x2a
+  ) {
+    const width = buf.readUInt16LE(26) & 0x3fff;
+    const height = buf.readUInt16LE(28) & 0x3fff;
+    return width > 0 && height > 0 ? { width, height } : null;
+  }
+  if (chunk === "VP8L" && buf.length >= 25 && buf[20] === 0x2f) {
+    const bits = buf.readUInt32LE(21);
+    const width = (bits & 0x3fff) + 1;
+    const height = ((bits >>> 14) & 0x3fff) + 1;
+    return width > 0 && height > 0 ? { width, height } : null;
+  }
+
+  return null;
+}
+
+export function inspectImageDimensions(
+  base64Data: string,
+): ImageDimensions | null {
+  const buf = decodeBase64Payload(base64Data);
+  if (buf.length === 0) {
+    return null;
+  }
+
+  if (
+    buf.length >= 24 &&
+    buf[0] === 0x89 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x4e &&
+    buf[3] === 0x47 &&
+    buf[4] === 0x0d &&
+    buf[5] === 0x0a &&
+    buf[6] === 0x1a &&
+    buf[7] === 0x0a &&
+    buf.toString("ascii", 12, 16) === "IHDR"
+  ) {
+    const width = buf.readUInt32BE(16);
+    const height = buf.readUInt32BE(20);
+    return width > 0 && height > 0
+      ? { format: "png", width, height, byteLength: buf.length }
+      : null;
+  }
+
+  if (buf.length >= 10) {
+    const gifHeader = buf.toString("ascii", 0, 6);
+    if (gifHeader === "GIF87a" || gifHeader === "GIF89a") {
+      const width = buf.readUInt16LE(6);
+      const height = buf.readUInt16LE(8);
+      return width > 0 && height > 0
+        ? { format: "gif", width, height, byteLength: buf.length }
+        : null;
+    }
+  }
+
+  const jpegDims = parseJpegDimensions(buf);
+  if (jpegDims) {
+    return {
+      format: "jpeg",
+      width: jpegDims.width,
+      height: jpegDims.height,
+      byteLength: buf.length,
+    };
+  }
+
+  const webpDims = parseWebpDimensions(buf);
+  if (webpDims) {
+    return {
+      format: "webp",
+      width: webpDims.width,
+      height: webpDims.height,
+      byteLength: buf.length,
+    };
+  }
+
+  return null;
+}
+
 function summarizeContentItemForPreview(item: Record<string, unknown>): string {
   if (typeof item.text === "string") {
     return item.text;
@@ -415,10 +679,20 @@ function summarizeContentItemForPreview(item: Record<string, unknown>): string {
       return `[binary resource blob (${res.blob.length} base64 chars, uri=${uri})]`;
     }
   }
-  if (item.type === "image" || item.type === "audio") {
+  if (item.type === "image") {
     const mime = typeof item.mimeType === "string" ? item.mimeType : "binary";
     const dataLen = typeof item.data === "string" ? item.data.length : 0;
-    return `[${item.type} block (${mime}, ${dataLen} base64 chars)]`;
+    const dims =
+      typeof item.data === "string" ? inspectImageDimensions(item.data) : null;
+    if (dims) {
+      return `[image block (${mime}, ${dims.width}x${dims.height}px, ${dataLen} base64 chars)]`;
+    }
+    return `[image block (${mime}, ${dataLen} base64 chars)]`;
+  }
+  if (item.type === "audio") {
+    const mime = typeof item.mimeType === "string" ? item.mimeType : "binary";
+    const dataLen = typeof item.data === "string" ? item.data.length : 0;
+    return `[audio block (${mime}, ${dataLen} base64 chars)]`;
   }
   return "";
 }
@@ -1318,44 +1592,143 @@ export async function guardToolCallResult(
   result: unknown;
   spilledPath: string | null;
   originalBytes: number;
+  spilledImages: SpilledImageMetadata[];
 }> {
   const processed = options.redactSecrets
     ? redactSecretsInValue(result)
     : result;
-  const serialized = JSON.stringify(processed ?? null);
-  const originalBytes = Buffer.byteLength(serialized, "utf8");
+  const originalSerialized = JSON.stringify(processed ?? null);
+  const originalBytes = Buffer.byteLength(originalSerialized, "utf8");
   const maxKb = options.maxResultKb ?? 512;
   const maxBytes = maxKb * 1024;
+  const maxImageDim =
+    options.maxImageDimension ?? DEFAULT_MAX_IMAGE_DIMENSION_PX;
+  const spillDir = options.spillDir ?? join(tmpdir(), "mcp-diet-spills");
 
-  if (maxKb <= 0 || originalBytes <= maxBytes) {
+  let updatedProcessed = processed;
+  const spilledImages: SpilledImageMetadata[] = [];
+  let spillDirCreated = false;
+
+  const processedRecord =
+    processed && typeof processed === "object" && !Array.isArray(processed)
+      ? (processed as Record<string, unknown>)
+      : null;
+
+  if (
+    maxImageDim > 0 &&
+    processedRecord &&
+    Array.isArray(processedRecord.content)
+  ) {
+    const contentItems = processedRecord.content;
+    let nextContent: unknown[] | null = null;
+
+    for (let idx = 0; idx < contentItems.length; idx++) {
+      const item = contentItems[idx];
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        continue;
+      }
+      const recordItem = item as Record<string, unknown>;
+      if (recordItem.type !== "image" || typeof recordItem.data !== "string") {
+        continue;
+      }
+
+      const dims = inspectImageDimensions(recordItem.data);
+      if (!dims || (dims.width <= maxImageDim && dims.height <= maxImageDim)) {
+        continue;
+      }
+
+      if (!spillDirCreated) {
+        await mkdir(spillDir, { recursive: true });
+        spillDirCreated = true;
+      }
+      if (nextContent === null) {
+        nextContent = [...contentItems];
+      }
+
+      const imgBuf = decodeBase64Payload(recordItem.data);
+      const sha256 = createHash("sha256").update(imgBuf).digest("hex");
+      const ext = dims.format === "jpeg" ? "jpg" : dims.format;
+      const mimeType =
+        typeof recordItem.mimeType === "string"
+          ? recordItem.mimeType
+          : `image/${dims.format}`;
+      const imgPath = join(
+        spillDir,
+        `mcp-tool-image-${Date.now()}-${sha256.slice(0, 12)}-${idx}.${ext}`,
+      );
+      await writeFile(imgPath, imgBuf);
+
+      spilledImages.push({
+        index: idx,
+        path: imgPath,
+        mimeType,
+        format: dims.format,
+        width: dims.width,
+        height: dims.height,
+        byteLength: dims.byteLength,
+        maxDimensionPx: maxImageDim,
+        sha256,
+      });
+
+      nextContent[idx] = {
+        type: "text",
+        text: [
+          `[mcp-diet] Oversized image block intercepted (${dims.width}x${dims.height}px > ${maxImageDim}px max dimension; ${mimeType}, ${(dims.byteLength / 1024).toFixed(1)} KiB).`,
+          `Prevents Claude Code many-image >2000px session lockup.`,
+          `Binary image saved to local file: ${imgPath} (sha256=${sha256.slice(0, 12)})`,
+        ].join("\n"),
+      };
+    }
+
+    if (nextContent !== null && spilledImages.length > 0) {
+      updatedProcessed = {
+        ...processedRecord,
+        content: nextContent,
+        _mcpDietSpilledImages: spilledImages,
+      };
+    }
+  }
+
+  const currentSerialized =
+    updatedProcessed === processed
+      ? originalSerialized
+      : JSON.stringify(updatedProcessed ?? null);
+  const currentBytes = Buffer.byteLength(currentSerialized, "utf8");
+
+  if (maxKb <= 0 || currentBytes <= maxBytes) {
     return {
-      result: processed,
+      result: updatedProcessed,
       spilledPath: null,
       originalBytes,
+      spilledImages,
     };
   }
 
-  const spillDir = options.spillDir ?? join(tmpdir(), "mcp-diet-spills");
-  await mkdir(spillDir, { recursive: true });
+  if (!spillDirCreated) {
+    await mkdir(spillDir, { recursive: true });
+    spillDirCreated = true;
+  }
 
   const digest = createHash("sha256")
-    .update(serialized)
+    .update(currentSerialized)
     .digest("hex")
     .slice(0, 12);
   const spilledPath = join(
     spillDir,
     `mcp-tool-output-${Date.now()}-${digest}.json`,
   );
-  await writeFile(spilledPath, serialized, "utf8");
+  await writeFile(spilledPath, currentSerialized, "utf8");
 
-  let previewText = serialized;
-  const processedRecord =
-    processed && typeof processed === "object"
-      ? (processed as Record<string, unknown>)
+  let previewText = currentSerialized;
+  const updatedRecord =
+    updatedProcessed &&
+    typeof updatedProcessed === "object" &&
+    !Array.isArray(updatedProcessed)
+      ? (updatedProcessed as Record<string, unknown>)
       : null;
 
-  if (processedRecord && Array.isArray(processedRecord.content)) {
-    const contentItems = processedRecord.content as Array<
+  if (updatedRecord && Array.isArray(updatedRecord.content)) {
+    const contentItems = updatedRecord.content as Array<
       Record<string, unknown>
     >;
     const joinedText = contentItems
@@ -1373,7 +1746,7 @@ export async function guardToolCallResult(
 
   const structureMap = buildSpillStructureMap(previewText);
   const formattedText = formatSpillNotificationText({
-    originalBytes,
+    originalBytes: currentBytes,
     maxKb,
     maxBytes,
     spilledPath,
@@ -1384,8 +1757,9 @@ export async function guardToolCallResult(
   return {
     spilledPath,
     originalBytes,
+    spilledImages,
     result: {
-      ...(processedRecord?.isError === true ? { isError: true } : {}),
+      ...(updatedRecord?.isError === true ? { isError: true } : {}),
       content: [
         {
           type: "text",
@@ -1394,12 +1768,13 @@ export async function guardToolCallResult(
       ],
       _mcpDietSpilled: {
         path: spilledPath,
-        originalBytes,
+        originalBytes: currentBytes,
         maxBytes,
         totalBytes: structureMap.totalBytes,
         totalLines: structureMap.totalLines,
         sha256: structureMap.sha256,
         sections: structureMap.sections,
+        ...(spilledImages.length > 0 ? { spilledImages } : {}),
       },
     },
   };
@@ -1410,6 +1785,7 @@ export async function transformJsonRpcMessage(
   options: McpDietOptions = {},
   pendingRequests?: Map<string | number, string>,
   knownTools?: Map<string, McpToolDefinition>,
+  telemetry?: SpillTelemetryTracker,
 ): Promise<string> {
   const trimmed = rawLine.trim();
   if (!trimmed.startsWith("{")) {
@@ -1485,6 +1861,10 @@ export async function transformJsonRpcMessage(
     (method === "tools/call" || Array.isArray(resultObj.content))
   ) {
     const guarded = await guardToolCallResult(resultObj, options);
+    telemetry?.recordToolCall({
+      spilledPath: guarded.spilledPath,
+      imageSpillCount: guarded.spilledImages.length,
+    });
     return JSON.stringify({
       ...parsed,
       result: guarded.result,
@@ -1550,6 +1930,7 @@ function resolveWindowsSpawn(
 export interface StdioProxyHandle {
   child: ChildProcessWithoutNullStreams;
   close: () => void;
+  getTelemetry: () => SpillTelemetryStats;
 }
 
 export function startStdioMcpProxy(params: {
@@ -1565,6 +1946,7 @@ export function startStdioMcpProxy(params: {
   const clientOut = params.clientOut ?? process.stdout;
   const clientErr = params.clientErr ?? process.stderr;
   const env = params.env ?? process.env;
+  const telemetry = createSpillTelemetryTracker();
 
   const resolved = resolveWindowsSpawn(params.command, params.args, env);
   const child = spawn(resolved.command, resolved.args, {
@@ -1637,6 +2019,9 @@ export function startStdioMcpProxy(params: {
                 ? (msgParams.arguments as Record<string, unknown>)
                 : {};
             const readResult = executeReadSpillTool(toolArgs, params.options);
+            if (!readResult.isError) {
+              telemetry.recordSpillRead(readResult._mcpDietRead?.path);
+            }
             clientOut.write(
               `${JSON.stringify({
                 jsonrpc: "2.0",
@@ -1716,6 +2101,7 @@ export function startStdioMcpProxy(params: {
               params.options,
               pendingRequests,
               knownTools,
+              telemetry,
             );
             clientOut.write(`${transformed}\n`);
             return;
@@ -1739,6 +2125,7 @@ export function startStdioMcpProxy(params: {
             params.options,
             pendingRequests,
             knownTools,
+            telemetry,
           );
           clientOut.write(`${transformed}\n`);
         } catch {
@@ -1768,7 +2155,7 @@ export function startStdioMcpProxy(params: {
     child.kill();
   };
 
-  return { child, close };
+  return { child, close, getTelemetry: () => telemetry.getStats() };
 }
 
 export const STANDALONE_MCP_TOOLS: McpToolDefinition[] = [
@@ -1853,6 +2240,7 @@ export const STANDALONE_MCP_TOOLS: McpToolDefinition[] = [
 
 export interface StandaloneServerHandle {
   close: () => void;
+  getTelemetry: () => SpillTelemetryStats;
 }
 
 export function startStandaloneMcpServer(params?: {
@@ -1862,9 +2250,10 @@ export function startStandaloneMcpServer(params?: {
   clientOut?: Writable;
 }): StandaloneServerHandle {
   const options = params?.options ?? {};
-  const version = params?.version ?? "0.2.0";
+  const version = params?.version ?? "0.3.0";
   const clientIn = params?.clientIn ?? process.stdin;
   const clientOut = params?.clientOut ?? process.stdout;
+  const telemetry = createSpillTelemetryTracker();
 
   const activeStandaloneTools = options.disableSpillReader
     ? STANDALONE_MCP_TOOLS.filter(
@@ -2036,6 +2425,9 @@ export function startStandaloneMcpServer(params?: {
 
           if (toolName === MCP_DIET_READ_SPILL_TOOL.name) {
             const readResult = executeReadSpillTool(toolArgs, options);
+            if (!readResult.isError) {
+              telemetry.recordSpillRead(readResult._mcpDietRead?.path);
+            }
             clientOut.write(
               `${JSON.stringify({
                 jsonrpc: "2.0",
@@ -2089,6 +2481,7 @@ export function startStandaloneMcpServer(params?: {
                       mode: "standalone",
                       version,
                       options,
+                      telemetry: telemetry.getStats(),
                     },
                     null,
                     2,
@@ -2109,6 +2502,10 @@ export function startStandaloneMcpServer(params?: {
           }
 
           const guarded = await guardToolCallResult(rawToolResult, options);
+          telemetry.recordToolCall({
+            spilledPath: guarded.spilledPath,
+            imageSpillCount: guarded.spilledImages.length,
+          });
           clientOut.write(
             `${JSON.stringify({
               jsonrpc: "2.0",
@@ -2139,5 +2536,5 @@ export function startStandaloneMcpServer(params?: {
     reader.close();
   };
 
-  return { close };
+  return { close, getTelemetry: () => telemetry.getStats() };
 }
