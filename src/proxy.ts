@@ -44,7 +44,12 @@ export interface SpilledImageMetadata {
   sha256: string;
 }
 
-export interface SpillTelemetryStats {
+export interface UpstreamServerInfo {
+  name: string;
+  version?: string;
+}
+
+export interface ToolSpillTelemetryStats {
   toolCallsInspected: number;
   byteSpillsTriggered: number;
   imageDimensionSpillsTriggered: number;
@@ -54,13 +59,83 @@ export interface SpillTelemetryStats {
   spillReadFollowUpRate: number;
 }
 
+export interface SpillTelemetryStats extends ToolSpillTelemetryStats {
+  upstreamServer: UpstreamServerInfo | null;
+  byTool: Record<string, ToolSpillTelemetryStats>;
+}
+
 export interface SpillTelemetryTracker {
+  setUpstreamServer: (info: UpstreamServerInfo) => void;
   recordToolCall: (params: {
+    toolName?: string | null;
     spilledPath: string | null;
     imageSpillCount: number;
   }) => void;
   recordSpillRead: (path?: string) => void;
   getStats: () => SpillTelemetryStats;
+}
+
+interface TelemetryCounterBucket {
+  toolCallsInspected: number;
+  byteSpillsTriggered: number;
+  imageDimensionSpillsTriggered: number;
+  spillReadsCount: number;
+  spilledPaths: Set<string>;
+  readPaths: Set<string>;
+}
+
+function createTelemetryBucket(): TelemetryCounterBucket {
+  return {
+    toolCallsInspected: 0,
+    byteSpillsTriggered: 0,
+    imageDimensionSpillsTriggered: 0,
+    spillReadsCount: 0,
+    spilledPaths: new Set<string>(),
+    readPaths: new Set<string>(),
+  };
+}
+
+function recordBucketToolCall(
+  bucket: TelemetryCounterBucket,
+  normalizedSpillPath: string | null,
+  imageSpillCount: number,
+): void {
+  bucket.toolCallsInspected += 1;
+  if (normalizedSpillPath) {
+    bucket.byteSpillsTriggered += 1;
+    bucket.spilledPaths.add(normalizedSpillPath);
+  }
+  if (imageSpillCount > 0) {
+    bucket.imageDimensionSpillsTriggered += imageSpillCount;
+  }
+}
+
+function finalizeTelemetryBucket(
+  bucket: TelemetryCounterBucket,
+): ToolSpillTelemetryStats {
+  let uniqueSpillsReadCount = 0;
+  for (const path of bucket.spilledPaths) {
+    if (bucket.readPaths.has(path)) {
+      uniqueSpillsReadCount += 1;
+    }
+  }
+  const previewOnlySpillsCount = Math.max(
+    0,
+    bucket.byteSpillsTriggered - uniqueSpillsReadCount,
+  );
+  const spillReadFollowUpRate =
+    bucket.byteSpillsTriggered > 0
+      ? Number((uniqueSpillsReadCount / bucket.byteSpillsTriggered).toFixed(4))
+      : 0;
+  return {
+    toolCallsInspected: bucket.toolCallsInspected,
+    byteSpillsTriggered: bucket.byteSpillsTriggered,
+    imageDimensionSpillsTriggered: bucket.imageDimensionSpillsTriggered,
+    spillReadsCount: bucket.spillReadsCount,
+    uniqueSpillsReadCount,
+    previewOnlySpillsCount,
+    spillReadFollowUpRate,
+  };
 }
 
 function normalizeTrackablePath(filePath: string): string {
@@ -71,54 +146,74 @@ function normalizeTrackablePath(filePath: string): string {
   }
 }
 
-export function createSpillTelemetryTracker(): SpillTelemetryTracker {
-  let toolCallsInspected = 0;
-  let byteSpillsTriggered = 0;
-  let imageDimensionSpillsTriggered = 0;
-  let spillReadsCount = 0;
-  const spilledPaths = new Set<string>();
-  const readPaths = new Set<string>();
+export function createSpillTelemetryTracker(
+  initialServer: UpstreamServerInfo | null = null,
+): SpillTelemetryTracker {
+  let upstreamServer: UpstreamServerInfo | null = initialServer;
+  const globalBucket = createTelemetryBucket();
+  const byToolBuckets = new Map<string, TelemetryCounterBucket>();
+  const spillPathToTool = new Map<string, string>();
 
   return {
-    recordToolCall({ spilledPath, imageSpillCount }) {
-      toolCallsInspected += 1;
-      if (spilledPath) {
-        byteSpillsTriggered += 1;
-        spilledPaths.add(normalizeTrackablePath(spilledPath));
+    setUpstreamServer(info: UpstreamServerInfo) {
+      if (typeof info.name === "string" && info.name.trim()) {
+        upstreamServer = {
+          name: info.name,
+          ...(typeof info.version === "string" && info.version.trim()
+            ? { version: info.version }
+            : {}),
+        };
       }
-      if (imageSpillCount > 0) {
-        imageDimensionSpillsTriggered += imageSpillCount;
+    },
+    recordToolCall({ toolName, spilledPath, imageSpillCount }) {
+      const normalizedToolName =
+        typeof toolName === "string" && toolName.trim().length > 0
+          ? toolName
+          : null;
+      const normalizedSpillPath = spilledPath
+        ? normalizeTrackablePath(spilledPath)
+        : null;
+
+      recordBucketToolCall(globalBucket, normalizedSpillPath, imageSpillCount);
+
+      if (normalizedToolName) {
+        let toolBucket = byToolBuckets.get(normalizedToolName);
+        if (!toolBucket) {
+          toolBucket = createTelemetryBucket();
+          byToolBuckets.set(normalizedToolName, toolBucket);
+        }
+        recordBucketToolCall(toolBucket, normalizedSpillPath, imageSpillCount);
+        if (normalizedSpillPath) {
+          spillPathToTool.set(normalizedSpillPath, normalizedToolName);
+        }
       }
     },
     recordSpillRead(filePath?: string) {
-      spillReadsCount += 1;
-      if (filePath) {
-        readPaths.add(normalizeTrackablePath(filePath));
+      globalBucket.spillReadsCount += 1;
+      const normalizedPath = filePath ? normalizeTrackablePath(filePath) : null;
+      if (normalizedPath) {
+        globalBucket.readPaths.add(normalizedPath);
+        const ownerTool = spillPathToTool.get(normalizedPath);
+        if (ownerTool) {
+          const toolBucket = byToolBuckets.get(ownerTool);
+          if (toolBucket) {
+            toolBucket.spillReadsCount += 1;
+            toolBucket.readPaths.add(normalizedPath);
+          }
+        }
       }
     },
     getStats(): SpillTelemetryStats {
-      let uniqueSpillsReadCount = 0;
-      for (const path of spilledPaths) {
-        if (readPaths.has(path)) {
-          uniqueSpillsReadCount += 1;
-        }
+      const byTool: Record<string, ToolSpillTelemetryStats> = {};
+      for (const name of [...byToolBuckets.keys()].sort((a, b) =>
+        a.localeCompare(b),
+      )) {
+        byTool[name] = finalizeTelemetryBucket(byToolBuckets.get(name)!);
       }
-      const previewOnlySpillsCount = Math.max(
-        0,
-        byteSpillsTriggered - uniqueSpillsReadCount,
-      );
-      const spillReadFollowUpRate =
-        byteSpillsTriggered > 0
-          ? Number((uniqueSpillsReadCount / byteSpillsTriggered).toFixed(4))
-          : 0;
       return {
-        toolCallsInspected,
-        byteSpillsTriggered,
-        imageDimensionSpillsTriggered,
-        spillReadsCount,
-        uniqueSpillsReadCount,
-        previewOnlySpillsCount,
-        spillReadFollowUpRate,
+        upstreamServer,
+        ...finalizeTelemetryBucket(globalBucket),
+        byTool,
       };
     },
   };
@@ -130,6 +225,7 @@ export interface McpDietOptions {
   readOnly?: boolean;
   maxDescChars?: number;
   maxResultKb?: number;
+  previewChars?: number;
   maxImageDimension?: number;
   redactSecrets?: boolean;
   spillDir?: string;
@@ -1049,14 +1145,25 @@ function parseJsonStructureSections(
 export function buildSpillStructureMap(
   text: string,
   maxEntries = 20,
+  previewChars?: number,
 ): SpillStructureMap {
+  const hasCustomPreview =
+    previewChars !== undefined && Number.isFinite(previewChars) && previewChars > 0;
+  const headChars = hasCustomPreview
+    ? Math.max(1, Math.floor(previewChars))
+    : HEAD_PREVIEW_CHARS;
+  const tailChars = hasCustomPreview
+    ? Math.max(100, Math.round(headChars / 3))
+    : TAIL_PREVIEW_CHARS;
+  const tailThreshold = hasCustomPreview
+    ? headChars + tailChars
+    : TAIL_PREVIEW_THRESHOLD;
+
   const totalBytes = Buffer.byteLength(text, "utf8");
   const sha256 = createHash("sha256").update(text, "utf8").digest("hex");
-  const headPreview = text.slice(0, HEAD_PREVIEW_CHARS);
+  const headPreview = text.slice(0, headChars);
   const tailPreview =
-    text.length > TAIL_PREVIEW_THRESHOLD
-      ? text.slice(-TAIL_PREVIEW_CHARS)
-      : undefined;
+    text.length > tailThreshold ? text.slice(-tailChars) : undefined;
 
   const lineSpans = computeLineSpans(text);
   const totalLines = lineSpans.length;
@@ -1570,16 +1677,27 @@ function formatSpillNotificationText(params: {
     return lines.join("\n");
   };
 
+  const defaultHeadLimit = structureMap.headPreview.length;
+  const defaultTailLimit = structureMap.tailPreview?.length ?? 0;
+
   let formatted = buildText(
     structureMap.sections.length,
-    HEAD_PREVIEW_CHARS,
-    TAIL_PREVIEW_CHARS,
+    defaultHeadLimit,
+    defaultTailLimit,
   );
   // Keep spill summary strictly under tiny test thresholds (e.g. maxResultKb: 4)
   if (maxBytes <= 8192 && formatted.length >= maxBytes) {
-    formatted = buildText(Math.min(10, structureMap.sections.length), 600, 200);
+    formatted = buildText(
+      Math.min(10, structureMap.sections.length),
+      Math.min(600, defaultHeadLimit),
+      Math.min(200, defaultTailLimit),
+    );
     if (formatted.length >= maxBytes) {
-      formatted = buildText(Math.min(5, structureMap.sections.length), 300, 100);
+      formatted = buildText(
+        Math.min(5, structureMap.sections.length),
+        Math.min(300, defaultHeadLimit),
+        Math.min(100, defaultTailLimit),
+      );
     }
   }
   return formatted;
@@ -1744,7 +1862,11 @@ export async function guardToolCallResult(
     }
   }
 
-  const structureMap = buildSpillStructureMap(previewText);
+  const structureMap = buildSpillStructureMap(
+    previewText,
+    20,
+    options.previewChars,
+  );
   const formattedText = formatSpillNotificationText({
     originalBytes: currentBytes,
     maxKb,
@@ -1786,6 +1908,7 @@ export async function transformJsonRpcMessage(
   pendingRequests?: Map<string | number, string>,
   knownTools?: Map<string, McpToolDefinition>,
   telemetry?: SpillTelemetryTracker,
+  pendingToolNames?: Map<string | number, string>,
 ): Promise<string> {
   const trimmed = rawLine.trim();
   if (!trimmed.startsWith("{")) {
@@ -1804,14 +1927,38 @@ export async function transformJsonRpcMessage(
       ? parsed.id
       : undefined;
   const method = id !== undefined ? pendingRequests?.get(id) : undefined;
-  if (id !== undefined && pendingRequests) {
-    pendingRequests.delete(id);
+  const toolName = id !== undefined ? pendingToolNames?.get(id) : undefined;
+  if (id !== undefined) {
+    pendingRequests?.delete(id);
+    pendingToolNames?.delete(id);
   }
 
   const resultObj =
     parsed.result && typeof parsed.result === "object"
       ? (parsed.result as Record<string, unknown>)
       : null;
+
+  if (method === "initialize" && resultObj) {
+    const serverInfo =
+      resultObj.serverInfo &&
+      typeof resultObj.serverInfo === "object" &&
+      !Array.isArray(resultObj.serverInfo)
+        ? (resultObj.serverInfo as Record<string, unknown>)
+        : null;
+    if (
+      serverInfo &&
+      typeof serverInfo.name === "string" &&
+      serverInfo.name.trim().length > 0
+    ) {
+      telemetry?.setUpstreamServer({
+        name: serverInfo.name,
+        ...(typeof serverInfo.version === "string" &&
+        serverInfo.version.trim().length > 0
+          ? { version: serverInfo.version }
+          : {}),
+      });
+    }
+  }
 
   if (resultObj && Array.isArray(resultObj.tools)) {
     const rawTools = resultObj.tools as McpToolDefinition[];
@@ -1862,6 +2009,7 @@ export async function transformJsonRpcMessage(
   ) {
     const guarded = await guardToolCallResult(resultObj, options);
     telemetry?.recordToolCall({
+      toolName,
       spilledPath: guarded.spilledPath,
       imageSpillCount: guarded.spilledImages.length,
     });
@@ -1957,6 +2105,7 @@ export function startStdioMcpProxy(params: {
   });
 
   const pendingRequests = new Map<string | number, string>();
+  const pendingToolNames = new Map<string | number, string>();
   const knownTools = new Map<string, McpToolDefinition>();
   if (!params.options.disableSpillReader) {
     knownTools.set(MCP_DIET_READ_SPILL_TOOL.name, MCP_DIET_READ_SPILL_TOOL);
@@ -1974,17 +2123,18 @@ export function startStdioMcpProxy(params: {
             : undefined;
         const msgMethod =
           typeof msg.method === "string" ? msg.method : undefined;
+        const msgParams =
+          msg.params && typeof msg.params === "object"
+            ? (msg.params as Record<string, unknown>)
+            : null;
+        const toolName =
+          msgMethod === "tools/call" &&
+          msgParams &&
+          typeof msgParams.name === "string"
+            ? msgParams.name
+            : null;
 
         if (msgMethod === "tools/call" && msgId !== undefined) {
-          const msgParams =
-            msg.params && typeof msg.params === "object"
-              ? (msg.params as Record<string, unknown>)
-              : null;
-          const toolName =
-            msgParams && typeof msgParams.name === "string"
-              ? msgParams.name
-              : null;
-
           if (
             toolName === MCP_DIET_READ_SPILL_TOOL.name &&
             !params.options.disableSpillReader
@@ -2056,6 +2206,9 @@ export function startStdioMcpProxy(params: {
 
         if (msgId !== undefined && msgMethod !== undefined) {
           pendingRequests.set(msgId, msgMethod);
+          if (toolName) {
+            pendingToolNames.set(msgId, toolName);
+          }
         }
       } catch {
         // Forward verbatim
@@ -2102,6 +2255,7 @@ export function startStdioMcpProxy(params: {
               pendingRequests,
               knownTools,
               telemetry,
+              pendingToolNames,
             );
             clientOut.write(`${transformed}\n`);
             return;
@@ -2126,6 +2280,7 @@ export function startStdioMcpProxy(params: {
             pendingRequests,
             knownTools,
             telemetry,
+            pendingToolNames,
           );
           clientOut.write(`${transformed}\n`);
         } catch {
@@ -2250,10 +2405,13 @@ export function startStandaloneMcpServer(params?: {
   clientOut?: Writable;
 }): StandaloneServerHandle {
   const options = params?.options ?? {};
-  const version = params?.version ?? "0.3.0";
+  const version = params?.version ?? "0.3.1";
   const clientIn = params?.clientIn ?? process.stdin;
   const clientOut = params?.clientOut ?? process.stdout;
-  const telemetry = createSpillTelemetryTracker();
+  const telemetry = createSpillTelemetryTracker({
+    name: "@framy2/mcp-diet",
+    version,
+  });
 
   const activeStandaloneTools = options.disableSpillReader
     ? STANDALONE_MCP_TOOLS.filter(
@@ -2503,6 +2661,7 @@ export function startStandaloneMcpServer(params?: {
 
           const guarded = await guardToolCallResult(rawToolResult, options);
           telemetry.recordToolCall({
+            toolName,
             spilledPath: guarded.spilledPath,
             imageSpillCount: guarded.spilledImages.length,
           });

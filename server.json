@@ -3,7 +3,7 @@
   "name": "io.github.FramY2/mcp-diet",
   "title": "mcp-diet",
   "description": "Zero-dependency stdio MCP proxy and runtime context firewall with deterministic tools/list tree-shaking, structured >=512 KiB spill offset maps, >2000px image dimension firewall, sandboxed spill paging (mcp_diet_read_spill), and live secret redaction.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "repository": {
     "url": "https://github.com/FramY2/mcp-diet",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "identifier": "@framy2/mcp-diet",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "transport": {
         "type": "stdio"
       }

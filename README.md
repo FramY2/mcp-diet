@@ -23,17 +23,18 @@ Companion runtime proxy to **[`FramY2/ctxwise`](https://github.com/FramY2/ctxwis
    - Filters `tools/list` responses before the agent sees them and deterministically sorts tools by name so **prompt prefix caching never invalidates**.
    - `--read-only` keeps only tools with `annotations.readOnlyHint === true` or safe read-only names (`get_*`, `list_*`, `read_*`, `search_*`).
    - `--max-desc <chars>` compacts verbose tool and parameter descriptions without mutating JSON schema types.
-2. **Oversized `tools/call` Crash Guard + Structured Spill Offset Maps (`--max-result-kb 512`)**:
+2. **Oversized `tools/call` Crash Guard + Structured Spill Offset Maps (`--max-result-kb 512`, `--preview-chars 1200`)**:
    - Prevents Claude Code's `>= 8 MiB` stdio buffer disconnect crash (`anthropics/claude-code#105703`) and 100k-token single-turn blowouts by spilling oversized `tools/call` outputs to a local file.
-   - Builds a deterministic **Structural Section & Offset Index** (`buildSpillStructureMap`) with `totalBytes`, `totalLines`, `sha256` digest, `headPreview` (~1,200 chars), `tailPreview` (~400 chars for payloads > 1,600 chars), and `[L1-L42 | bytes 0..1820]` byte/line ranges across JSON top-level keys/array chunks, Markdown headings, and log blocks (`ERROR`, `WARN`, `FAIL`, timestamps).
+   - Builds a deterministic **Structural Section & Offset Index** (`buildSpillStructureMap`) with `totalBytes`, `totalLines`, `sha256` digest, `headPreview` (default `1,200` chars, configurable per server wrapper via `--preview-chars <chars>`), `tailPreview` (default `400` chars or ~1/3 of `--preview-chars` when payloads exceed head + tail length), and `[L1-L42 | bytes 0..1820]` byte/line ranges across JSON top-level keys/array chunks, Markdown headings, and log blocks (`ERROR`, `WARN`, `FAIL`, timestamps).
 3. **`>2000px` Image Dimension Firewall (`--max-image-dim 2000`)**:
    - Zero-dependency binary header inspection (`PNG`, `JPEG`, `GIF`, `WebP`) catches `image` content blocks exceeding `2000px` on either side **even when the raw file size is well below `--max-result-kb`** — preventing Claude Code's irreversible *"An image in the conversation exceeds the dimension limit for many-image requests (2000px)"* session rejection.
-   - Spills oversized images cleanly to native `.png` / `.jpg` / `.gif` / `.webp` files inside `spillDir`, leaves `<=2000px` images inline, and can be tuned or disabled (`--max-image-dim 0`).
+   - **Why `2000px` is the session-safe default**: Anthropic allows up to `8000px` only while a request carries `<=20` images, then rejects anything over `2000px` once image `#21` arrives; because earlier tool outputs remain immutable in `messages[]` (and a single stdio wrapper cannot see user-pasted screenshots or sibling MCP servers), keeping `2000px` prevents delayed turn-21 lockups. Short `<=20`-image sessions can explicitly pass `--max-image-dim 8000` (or `0` to disable).
+   - Spills oversized images cleanly to native `.png` / `.jpg` / `.gif` / `.webp` files inside `spillDir`, leaving `<=2000px` images inline.
 4. **Sandboxed Spill Paging (`mcp_diet_read_spill`) & Follow-Up Telemetry (`--report-stats`)**:
    - Automatically injected into `tools/list` (with `readOnlyHint: true`, compatible with `--read-only`; opt out with `--no-spill-reader`) and intercepted locally in the proxy without reaching the downstream child process.
    - Supports 1-based line slicing (`startLine`/`endLine`), UTF-8 byte paging (`offsetBytes`/`maxBytes`), and RFC 6901 `jsonPointer` extraction (`/results/0/title`).
    - Hard-sandboxed via `realpathSync` verification (`dirname(realTarget) === realSpillDir` and `^mcp-tool-output-\d+-[a-f0-9]{12}\.json$`), rejecting path traversal, symlinks escaping `spillDir`, or arbitrary filesystem paths, while capping returned bytes and redacting secrets by default.
-   - Tracks `byteSpillsTriggered`, `imageDimensionSpillsTriggered`, `uniqueSpillsReadCount`, `previewOnlySpillsCount`, and `spillReadFollowUpRate` via `getTelemetry()`, `mcp_diet_status`, or `--report-stats` on stderr at exit.
+   - Tracks `upstreamServer` (`{ name, version }` captured from `initialize`), global counters (`byteSpillsTriggered`, `imageDimensionSpillsTriggered`, `uniqueSpillsReadCount`, `previewOnlySpillsCount`, `spillReadFollowUpRate`), and a per-tool `byTool` breakdown via `getTelemetry()`, `mcp_diet_status`, or `--report-stats` on stderr at exit.
 5. **Live `tools/call` Secret Redaction (`--redact-secrets`)**:
    - Masks leaked credentials (`sk-ant-*`, `sk-proj-*`, `ghp_*`, `AKIA*`, `://user:pass@`, `AccountKey=...`, `Bearer ...`, private keys) in tool call responses before they enter your LLM transcript.
 
@@ -50,7 +51,7 @@ Replace your MCP server command in `.mcp.json` or `~/.claude.json`:
       "command": "npx",
       "args": [
         "-y",
-        "@framy2/mcp-diet@0.3.0",
+        "@framy2/mcp-diet@0.3.1",
         "--read-only",
         "--max-desc",
         "160",
@@ -101,6 +102,7 @@ Options:
   --read-only             Keep only read-only tools (annotations.readOnlyHint or read-only heuristic)
   --max-desc <chars>      Deterministically truncate tool and property descriptions
   --max-result-kb <kb>    Spill oversized tools/call results to a temp file (default: 512)
+  --preview-chars <chars> Override spilled head preview length in chars (default: 1200)
   --max-image-dim <px>    Spill PNG/JPEG/GIF/WebP images wider/taller than <px> (default: 2000, 0 disables)
   --redact-secrets        Redact leaked API keys, PATs, and credentials in tools/call output
   --spill-dir <dir>       Custom directory for spilled oversized tool outputs
@@ -129,6 +131,8 @@ import {
   type SpillSectionEntry,
   type SpillStructureMap,
   type SpillTelemetryStats,
+  type ToolSpillTelemetryStats,
+  type UpstreamServerInfo,
 } from "@framy2/mcp-diet";
 ```
 

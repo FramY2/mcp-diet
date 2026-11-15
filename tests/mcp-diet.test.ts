@@ -719,7 +719,7 @@ describe("mcp-diet — oversized tools/call crash guard & secret redaction", () 
       });
     });
 
-    expect(out).toBe("0.3.0");
+    expect(out).toBe("0.3.1");
   });
 });
 
@@ -1430,26 +1430,31 @@ describe("mcp-diet v0.3.0 — image dimension firewall, binary image spills, and
     ).toBe("image");
   });
 
-  it("parses --max-image-dim and --report-stats flags and validates invalid values", () => {
+  it("parses --max-image-dim, --preview-chars, and --report-stats flags and validates invalid values", () => {
     const parsed = parseCliArgs([
       "--max-image-dim",
       "1568",
+      "--preview-chars",
+      "2400",
       "--report-stats",
       "--",
       "node",
       "server.js",
     ]);
     expect(parsed.options.maxImageDimension).toBe(1568);
+    expect(parsed.options.previewChars).toBe(2400);
     expect(parsed.reportStats).toBe(true);
 
-    const disabled = parseCliArgs([
+    const eqParsed = parseCliArgs([
       "--max-image-dim=0",
+      "--preview-chars=600",
       "--",
       "node",
       "server.js",
     ]);
-    expect(disabled.options.maxImageDimension).toBe(0);
-    expect(disabled.reportStats).toBe(false);
+    expect(eqParsed.options.maxImageDimension).toBe(0);
+    expect(eqParsed.options.previewChars).toBe(600);
+    expect(eqParsed.reportStats).toBe(false);
 
     expect(() => parseCliArgs(["--max-image-dim", "-5"])).toThrow(
       /--max-image-dim/,
@@ -1457,9 +1462,52 @@ describe("mcp-diet v0.3.0 — image dimension firewall, binary image spills, and
     expect(() => parseCliArgs(["--max-image-dim=abc"])).toThrow(
       /--max-image-dim/,
     );
+    expect(() => parseCliArgs(["--preview-chars", "0"])).toThrow(
+      /--preview-chars/,
+    );
+    expect(() => parseCliArgs(["--preview-chars=-10"])).toThrow(
+      /--preview-chars/,
+    );
+    expect(() => parseCliArgs(["--preview-chars=abc"])).toThrow(
+      /--preview-chars/,
+    );
   });
 
-  it("tracks byte spills, image dimension spills, and mcp_diet_read_spill follow-up rate in session telemetry", async () => {
+  it("supports custom previewChars in buildSpillStructureMap and guardToolCallResult", async () => {
+    const spillDir = await mkdtemp(join(tmpdir(), "mcp-diet-preview-"));
+    tempDirs.push(spillDir);
+
+    const largeText = Array.from(
+      { length: 420 },
+      (_, i) => `line-${String(i).padStart(3, "0")}-${"x".repeat(40)}`,
+    ).join("\n");
+
+    const customMap = buildSpillStructureMap(largeText, 20, 2400);
+    expect(customMap.headPreview.length).toBe(2400);
+    expect(customMap.tailPreview?.length).toBe(800);
+
+    const guarded = await guardToolCallResult(
+      { content: [{ type: "text", text: largeText }] },
+      { maxResultKb: 16, previewChars: 2400, spillDir },
+    );
+    const notice = (
+      guarded.result as { content: Array<{ text: string }> }
+    ).content[0]!.text;
+    expect(notice).toContain("Head Preview (first 2400 chars):");
+    expect(notice).toContain("Tail Preview (last 800 chars):");
+
+    const compactGuarded = await guardToolCallResult(
+      { content: [{ type: "text", text: largeText }] },
+      { maxResultKb: 4, previewChars: 200, spillDir },
+    );
+    const compactNotice = (
+      compactGuarded.result as { content: Array<{ text: string }> }
+    ).content[0]!.text;
+    expect(compactNotice).toContain("Head Preview (first 200 chars):");
+    expect(compactNotice).toContain("Tail Preview (last 100 chars):");
+  });
+
+  it("tracks upstreamServer, per-tool byTool stats, image dimension spills, and follow-up rate in session telemetry", async () => {
     const dir = await mkdtemp(join(tmpdir(), "mcp-diet-telemetry-"));
     tempDirs.push(dir);
     const spillDir = join(dir, "spills");
@@ -1474,23 +1522,47 @@ describe("mcp-diet v0.3.0 — image dimension firewall, binary image spills, and
         'const rl = createInterface({ input: process.stdin });',
         'rl.on("line", (line) => {',
         "  const msg = JSON.parse(line);",
+        '  if (msg.method === "initialize") {',
+        "    process.stdout.write(JSON.stringify({",
+        '      jsonrpc: "2.0",',
+        "      id: msg.id,",
+        "      result: {",
+        '        protocolVersion: "2025-03-26",',
+        "        capabilities: {},",
+        '        serverInfo: { name: "demo-log-server", version: "1.4.0" }',
+        "      }",
+        '    }) + "\\n");',
+        "  }",
         '  if (msg.method === "tools/list") {',
         "    process.stdout.write(JSON.stringify({",
         '      jsonrpc: "2.0",',
         "      id: msg.id,",
-        '      result: { tools: [{ name: "fetch_data", annotations: { readOnlyHint: true } }] }',
+        "      result: {",
+        "        tools: [",
+        '          { name: "fetch_logs", annotations: { readOnlyHint: true } },',
+        '          { name: "fetch_json", annotations: { readOnlyHint: true } }',
+        "        ]",
+        "      }",
         '    }) + "\\n");',
         "  }",
         '  if (msg.method === "tools/call") {',
+        "    const toolName = msg.params?.name;",
         "    const kind = msg.params?.arguments?.kind;",
-        '    if (kind === "big1" || kind === "big2") {',
-        "      const text = `# ${kind}\\n` + kind.repeat(2000);",
+        '    if (toolName === "fetch_logs") {',
+        '      const text = `# logs-${kind}\\n` + "L".repeat(4000);',
         "      process.stdout.write(JSON.stringify({",
         '        jsonrpc: "2.0",',
         "        id: msg.id,",
         '        result: { content: [{ type: "text", text }] }',
         '      }) + "\\n");',
-        '    } else if (kind === "bigimg") {',
+        '    } else if (toolName === "fetch_json" && kind === "bigjson") {',
+        '      const text = JSON.stringify({ items: Array.from({ length: 120 }, (_, i) => ({ id: i, val: "J".repeat(25) })) });',
+        "      process.stdout.write(JSON.stringify({",
+        '        jsonrpc: "2.0",',
+        "        id: msg.id,",
+        '        result: { content: [{ type: "text", text }] }',
+        '      }) + "\\n");',
+        '    } else if (toolName === "fetch_json" && kind === "bigimg") {',
         "      process.stdout.write(JSON.stringify({",
         '        jsonrpc: "2.0",',
         "        id: msg.id,",
@@ -1536,35 +1608,41 @@ describe("mcp-diet v0.3.0 — image dimension firewall, binary image spills, and
       });
 
     clientIn.write(
-      `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "fetch_data", arguments: { kind: "big1" } } })}\n`,
+      `${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {} } })}\n`,
     );
     await waitForLines(1);
+
+    // fetch_logs big payload -> agent follows up with mcp_diet_read_spill
+    clientIn.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "fetch_logs", arguments: { kind: "err" } } })}\n`,
+    );
+    await waitForLines(2);
     const spill1Path = (
-      JSON.parse(lines[0]!) as { result: { _mcpDietSpilled: { path: string } } }
+      JSON.parse(lines[1]!) as { result: { _mcpDietSpilled: { path: string } } }
     ).result._mcpDietSpilled.path;
 
-    // Agent follows up on spill 1
     clientIn.write(
       `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "mcp_diet_read_spill", arguments: { path: spill1Path, startLine: 1, endLine: 2 } } })}\n`,
     );
-    await waitForLines(2);
-
-    // Second large payload is answered from preview only (never read with mcp_diet_read_spill)
-    clientIn.write(
-      `${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "fetch_data", arguments: { kind: "big2" } } })}\n`,
-    );
     await waitForLines(3);
 
-    // Small-byte >2000px image call
+    // fetch_json big payload -> answered from preview only
     clientIn.write(
-      `${JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "fetch_data", arguments: { kind: "bigimg" } } })}\n`,
+      `${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "fetch_json", arguments: { kind: "bigjson" } } })}\n`,
     );
     await waitForLines(4);
+
+    // fetch_json small-byte >2000px image call
+    clientIn.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "fetch_json", arguments: { kind: "bigimg" } } })}\n`,
+    );
+    await waitForLines(5);
 
     const telemetry = proxy.getTelemetry();
     proxy.close();
 
     expect(telemetry).toEqual({
+      upstreamServer: { name: "demo-log-server", version: "1.4.0" },
       toolCallsInspected: 3,
       byteSpillsTriggered: 2,
       imageDimensionSpillsTriggered: 1,
@@ -1572,6 +1650,26 @@ describe("mcp-diet v0.3.0 — image dimension firewall, binary image spills, and
       uniqueSpillsReadCount: 1,
       previewOnlySpillsCount: 1,
       spillReadFollowUpRate: 0.5,
+      byTool: {
+        fetch_json: {
+          toolCallsInspected: 2,
+          byteSpillsTriggered: 1,
+          imageDimensionSpillsTriggered: 1,
+          spillReadsCount: 0,
+          uniqueSpillsReadCount: 0,
+          previewOnlySpillsCount: 1,
+          spillReadFollowUpRate: 0,
+        },
+        fetch_logs: {
+          toolCallsInspected: 1,
+          byteSpillsTriggered: 1,
+          imageDimensionSpillsTriggered: 0,
+          spillReadsCount: 1,
+          uniqueSpillsReadCount: 1,
+          previewOnlySpillsCount: 0,
+          spillReadFollowUpRate: 1,
+        },
+      },
     });
   });
 });

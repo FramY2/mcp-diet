@@ -27,6 +27,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   let readOnly = false;
   let maxDescChars: number | undefined;
   let maxResultKb = 512;
+  let previewChars: number | undefined;
   let maxImageDimension: number | undefined;
   let redactSecrets = false;
   let spillDir: string | undefined;
@@ -103,6 +104,26 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
         throw new Error("--max-result-kb must be a positive number.");
       }
       maxResultKb = val;
+    } else if (arg === "--preview-chars") {
+      const raw = argv[++i];
+      if (raw === undefined || raw === "") {
+        throw new Error("--preview-chars must be a positive integer.");
+      }
+      const val = Number(raw);
+      if (!Number.isInteger(val) || val <= 0) {
+        throw new Error("--preview-chars must be a positive integer.");
+      }
+      previewChars = val;
+    } else if (arg.startsWith("--preview-chars=")) {
+      const raw = arg.slice("--preview-chars=".length);
+      if (raw === "") {
+        throw new Error("--preview-chars must be a positive integer.");
+      }
+      const val = Number(raw);
+      if (!Number.isInteger(val) || val <= 0) {
+        throw new Error("--preview-chars must be a positive integer.");
+      }
+      previewChars = val;
     } else if (arg === "--max-image-dim") {
       const raw = argv[++i];
       if (raw === undefined || raw === "") {
@@ -151,6 +172,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       readOnly,
       maxDescChars,
       maxResultKb,
+      ...(previewChars !== undefined ? { previewChars } : {}),
       ...(maxImageDimension !== undefined ? { maxImageDimension } : {}),
       redactSecrets,
       spillDir,
@@ -166,9 +188,9 @@ function getVersion(): string {
     const pkg = JSON.parse(
       readFileSync(new URL("../package.json", import.meta.url), "utf8"),
     ) as { version?: string };
-    return pkg.version ?? "0.3.0";
+    return pkg.version ?? "0.3.1";
   } catch {
-    return "0.3.0";
+    return "0.3.1";
   }
 }
 
@@ -187,6 +209,7 @@ function printHelp(): void {
       "  --read-only             Keep only read-only tools (annotations.readOnlyHint or read-only heuristic)",
       "  --max-desc <chars>      Deterministically truncate tool and property descriptions",
       "  --max-result-kb <kb>    Spill oversized tools/call results to a temp file (default: 512)",
+      "  --preview-chars <chars> Override spilled head preview length in chars (default: 1200)",
       "  --max-image-dim <px>    Spill PNG/JPEG/GIF/WebP images wider/taller than <px> (default: 2000, 0 disables)",
       "  --redact-secrets        Redact leaked API keys, PATs, and credentials in tools/call output",
       "  --spill-dir <dir>       Custom directory for spilled oversized tool outputs",
